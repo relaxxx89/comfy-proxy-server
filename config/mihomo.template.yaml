@@ -62,9 +62,8 @@ proxy-groups:
   - name: PROXY
     type: select
     proxies:
-      - AUTO_SPEED
       - AUTO_FAILSAFE
-      - BENCH
+      - AUTO_SPEED
       - DIRECT
 
 rules:

@@ -99,7 +99,9 @@ fi
 
 MIN_BPS=$((THROUGHPUT_MIN_KBPS * 1024))
 TMP_DIR="$(mktemp -d "${ROOT_DIR}/runtime/rank.XXXXXX")"
-trap 'rm -rf "${TMP_DIR}"' EXIT INT TERM
+current_proxy="AUTO_SPEED"
+proxy_switched_to_bench=0
+cleanup_done=0
 
 api_base="http://${API_BIND}"
 auth_header=""
@@ -144,6 +146,34 @@ api_call() {
   fi
 }
 
+restore_proxy_group() {
+  if [ "${proxy_switched_to_bench}" -ne 1 ]; then
+    return 0
+  fi
+
+  escaped_proxy="$(printf '%s' "${current_proxy}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+  restore_payload="$(printf '{"name":"%s"}' "${escaped_proxy}")"
+  api_call PUT "/proxies/PROXY" "${restore_payload}" > /dev/null 2>&1 || true
+  proxy_switched_to_bench=0
+}
+
+cleanup_rank() {
+  if [ "${cleanup_done}" -eq 1 ]; then
+    return 0
+  fi
+  cleanup_done=1
+  restore_proxy_group
+  rm -rf "${TMP_DIR}"
+}
+
+on_signal() {
+  cleanup_rank
+  exit 130
+}
+
+trap cleanup_rank EXIT
+trap on_signal INT TERM
+
 if ! api_call GET "/version" > /dev/null 2>&1; then
   throughput_reason="api_unreachable"
   print_metrics
@@ -186,6 +216,7 @@ if ! api_call PUT "/proxies/PROXY" "${proxy_switch_payload}" > /dev/null 2>&1; t
   print_metrics
   exit 0
 fi
+proxy_switched_to_bench=1
 
 SCORES_FILE="${TMP_DIR}/scores.tsv"
 : > "${SCORES_FILE}"
@@ -236,8 +267,7 @@ while IFS= read -r candidate; do
   fi
 done < "${CANDIDATES_FILE}"
 
-restore_payload="$(jq -cn --arg name "${current_proxy}" '{name:$name}')"
-api_call PUT "/proxies/PROXY" "${restore_payload}" > /dev/null 2>&1 || true
+restore_proxy_group
 
 if [ "${throughput_ranked}" -le 0 ] || [ ! -s "${SCORES_FILE}" ]; then
   throughput_reason="no_valid_speed"

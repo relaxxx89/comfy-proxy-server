@@ -453,6 +453,9 @@ SANITIZE_ALLOW_PROTOCOLS="${SANITIZE_ALLOW_PROTOCOLS:-vless,trojan,ss,vmess}"
 SANITIZE_LOG_JSON="${SANITIZE_LOG_JSON:-true}"
 SANITIZE_VALIDATE_TIMEOUT_SEC="${SANITIZE_VALIDATE_TIMEOUT_SEC:-10}"
 SANITIZE_VALIDATE_MAX_ITERATIONS="${SANITIZE_VALIDATE_MAX_ITERATIONS:-80}"
+SANITIZE_EXCLUDE_HOST_PATTERNS="${SANITIZE_EXCLUDE_HOST_PATTERNS:-boot-lee.ru,openproxylist.com}"
+SANITIZE_DROP_ANONYMOUS_FLAGGED="${SANITIZE_DROP_ANONYMOUS_FLAGGED:-true}"
+SANITIZE_REQUIRE_TLS_HOST="${SANITIZE_REQUIRE_TLS_HOST:-true}"
 
 case "${SANITIZE_VALIDATE_TIMEOUT_SEC}" in
   ''|*[!0-9]*)
@@ -472,6 +475,26 @@ if [ "${SANITIZE_VALIDATE_MAX_ITERATIONS}" -le 0 ]; then
   SANITIZE_VALIDATE_MAX_ITERATIONS=80
 fi
 
+SANITIZE_EXCLUDE_HOST_PATTERNS="$(printf '%s' "${SANITIZE_EXCLUDE_HOST_PATTERNS}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+
+case "${SANITIZE_DROP_ANONYMOUS_FLAGGED}" in
+  true|TRUE|1|yes|YES)
+    SANITIZE_DROP_ANONYMOUS_FLAGGED=true
+    ;;
+  *)
+    SANITIZE_DROP_ANONYMOUS_FLAGGED=false
+    ;;
+esac
+
+case "${SANITIZE_REQUIRE_TLS_HOST}" in
+  true|TRUE|1|yes|YES)
+    SANITIZE_REQUIRE_TLS_HOST=true
+    ;;
+  *)
+    SANITIZE_REQUIRE_TLS_HOST=false
+    ;;
+esac
+
 mkdir -p "${PROVIDER_DIR}"
 if [ ! -f "${PROVIDER_FILE}" ]; then
   : > "${PROVIDER_FILE}"
@@ -487,10 +510,12 @@ TMP_DIR="$(mktemp -d "${RUNTIME_DIR}/sync.XXXXXX")"
 SOURCE_LIST_FILE="${TMP_DIR}/source-urls.txt"
 MERGED_URI_FILE="${TMP_DIR}/merged-uris.txt"
 FILTERED_FILE="${TMP_DIR}/filtered.txt"
+QUALITY_FILTERED_FILE="${TMP_DIR}/quality-filtered.txt"
 COUNTRY_FILTERED_FILE="${TMP_DIR}/country-filtered.txt"
 WORKING_FILE="${TMP_DIR}/working.txt"
 VALIDATE_LOG="${TMP_DIR}/validate.log"
 COUNTRY_EXCLUDED_COUNT_FILE="${TMP_DIR}/country-excluded-count.txt"
+QUALITY_DROPPED_COUNT_FILE="${TMP_DIR}/quality-dropped-count.txt"
 SINGLE_YAML_FILE="${TMP_DIR}/single-source.yaml"
 
 : > "${SOURCE_LIST_FILE}"
@@ -670,6 +695,136 @@ if [ "${filtered_count}" -eq 0 ]; then
   exit 0
 fi
 
+awk -v "exclude_csv=${SANITIZE_EXCLUDE_HOST_PATTERNS}" -v "drop_anonymous=${SANITIZE_DROP_ANONYMOUS_FLAGGED}" -v "require_tls_host=${SANITIZE_REQUIRE_TLS_HOST}" -v "dropped_count_file=${QUALITY_DROPPED_COUNT_FILE}" '
+function lowercase(value) {
+  return tolower(value)
+}
+function trim(value) {
+  sub(/^[[:space:]]+/, "", value)
+  sub(/[[:space:]]+$/, "", value)
+  return value
+}
+function parse_host(uri,    rest, atpos, qpos, slashpos, colonpos, rb) {
+  rest = uri
+  sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", rest)
+
+  atpos = index(rest, "@")
+  if (atpos > 0) {
+    rest = substr(rest, atpos + 1)
+  }
+
+  qpos = index(rest, "?")
+  if (qpos > 0) {
+    rest = substr(rest, 1, qpos - 1)
+  }
+
+  slashpos = index(rest, "/")
+  if (slashpos > 0) {
+    rest = substr(rest, 1, slashpos - 1)
+  }
+
+  if (substr(rest, 1, 1) == "[") {
+    rb = index(rest, "]")
+    if (rb > 1) {
+      return lowercase(substr(rest, 2, rb - 2))
+    }
+    return ""
+  }
+
+  colonpos = index(rest, ":")
+  if (colonpos > 0) {
+    rest = substr(rest, 1, colonpos - 1)
+  }
+  return lowercase(trim(rest))
+}
+function should_drop_by_pattern(host, uri_no_frag,    i, pattern) {
+  for (i in exclude_patterns) {
+    pattern = exclude_patterns[i]
+    if (pattern == "") {
+      continue
+    }
+    if (index(host, pattern) > 0) {
+      return 1
+    }
+    if (index(uri_no_frag, pattern) > 0) {
+      return 1
+    }
+  }
+  return 0
+}
+BEGIN {
+  dropped = 0
+  split(exclude_csv, exclude_parts, ",")
+  for (i in exclude_parts) {
+    part = trim(lowercase(exclude_parts[i]))
+    if (part != "") {
+      exclude_patterns[i] = part
+    }
+  }
+}
+{
+  line = trim($0)
+  if (line == "") {
+    next
+  }
+
+  uri_no_frag = line
+  hash_index = index(uri_no_frag, "#")
+  if (hash_index > 0) {
+    uri_no_frag = substr(uri_no_frag, 1, hash_index - 1)
+  }
+  uri_no_frag = lowercase(trim(uri_no_frag))
+
+  display_name = line
+  if (hash_index > 0) {
+    display_name = substr(line, hash_index + 1)
+  }
+  display_name = trim(display_name)
+  lower_name = lowercase(display_name)
+
+  scheme = uri_no_frag
+  sub(/:.*/, "", scheme)
+  host = parse_host(uri_no_frag)
+
+  if (drop_anonymous == "true") {
+    if (index(display_name, "🏳") > 0) {
+      dropped++
+      next
+    }
+    if (lower_name ~ /(^|[^a-z0-9])(vless|ss|vmess|trojan)-($|[^a-z0-9])/) {
+      dropped++
+      next
+    }
+  }
+
+  if (require_tls_host == "true") {
+    if ((scheme == "vless" || scheme == "vmess" || scheme == "trojan") && host == "") {
+      dropped++
+      next
+    }
+  }
+
+  if (should_drop_by_pattern(host, uri_no_frag)) {
+    dropped++
+    next
+  }
+
+  print line
+}
+END {
+  print dropped > dropped_count_file
+}
+' "${FILTERED_FILE}" > "${QUALITY_FILTERED_FILE}"
+
+quality_count="$(wc -l < "${QUALITY_FILTERED_FILE}" | tr -d ' ')"
+if [ "${quality_count}" -eq 0 ]; then
+  existing_count="$(count_provider_lines)"
+  dropped_count="${raw_count}"
+  write_status "degraded_direct" "no_quality_proxies" "${raw_count}" "${filtered_count}" "${existing_count}" "${dropped_count}" "${mode}" "direct" "${source_urls_joined}" "${source_total}" "${source_ok}" "${source_failed}" 0
+  log "No proxies left after quality filter, keeping previous provider file."
+  exit 0
+fi
+
 exclude_countries_upper="$(printf '%s' "${EXCLUDE_COUNTRIES}" | tr '[:lower:]' '[:upper:]' | tr -d ' ')"
 if [ -n "${exclude_countries_upper}" ]; then
   awk -v "exclude_csv=${exclude_countries_upper}" -v "excluded_count_file=${COUNTRY_EXCLUDED_COUNT_FILE}" '
@@ -748,10 +903,10 @@ BEGIN {
 END {
   print excluded_count > excluded_count_file
 }
-' "${FILTERED_FILE}" > "${COUNTRY_FILTERED_FILE}"
+' "${QUALITY_FILTERED_FILE}" > "${COUNTRY_FILTERED_FILE}"
   excluded_by_country="$(cat "${COUNTRY_EXCLUDED_COUNT_FILE}" 2>/dev/null || printf '0')"
 else
-  cp "${FILTERED_FILE}" "${COUNTRY_FILTERED_FILE}"
+  cp "${QUALITY_FILTERED_FILE}" "${COUNTRY_FILTERED_FILE}"
   excluded_by_country=0
 fi
 
