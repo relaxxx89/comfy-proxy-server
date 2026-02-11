@@ -9,13 +9,19 @@ PROVIDER_FILE="${PROVIDER_DIR}/main-subscription.yaml"
 RANKED_PROVIDER_FILE="${PROVIDER_DIR}/main-subscription-ranked.yaml"
 STATUS_FILE="${RUNTIME_DIR}/status.json"
 LOCK_DIR="${RUNTIME_DIR}/.sync.lock"
+LOCK_PID_FILE="${LOCK_DIR}/pid"
 TMP_DIR=""
+LOCK_OWNED=0
+LOCK_CLEANED=0
+INTERRUPTING=0
+INTERRUPT_GRACE_SEC=3
 
 throughput_tested=0
 throughput_ranked=0
 throughput_failed=0
 throughput_reason="not_run"
 throughput_timestamp=""
+validate_fail_reason="not_run"
 owner_uid_gid="$(stat -c '%u:%g' "${ROOT_DIR}" 2>/dev/null || true)"
 
 log() {
@@ -116,11 +122,76 @@ fetch_url() {
   return 1
 }
 
+run_with_timeout() {
+  timeout_sec="$1"
+  shift
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${timeout_sec}" "$@"
+    return $?
+  fi
+
+  "$@" &
+  command_pid=$!
+
+  (
+    sleep "${timeout_sec}"
+    kill -TERM "${command_pid}" >/dev/null 2>&1 || exit 0
+    sleep 2
+    kill -KILL "${command_pid}" >/dev/null 2>&1 || exit 0
+  ) &
+  watchdog_pid=$!
+
+  if wait "${command_pid}"; then
+    command_rc=0
+  else
+    command_rc=$?
+  fi
+
+  kill "${watchdog_pid}" >/dev/null 2>&1 || true
+  wait "${watchdog_pid}" >/dev/null 2>&1 || true
+
+  case "${command_rc}" in
+    137|143)
+      return 124
+      ;;
+  esac
+
+  return "${command_rc}"
+}
+
+cleanup_validate_container() {
+  container_name="$1"
+  run_with_timeout "${SANITIZE_VALIDATE_TIMEOUT_SEC}" docker rm -f "${container_name}" >/dev/null 2>&1 || true
+}
+
+set_validate_fail_reason_by_rc() {
+  rc="$1"
+  if [ "${rc}" -eq 124 ]; then
+    validate_fail_reason="timeout"
+  else
+    validate_fail_reason="docker_error"
+  fi
+}
+
+run_validate_docker() {
+  if run_with_timeout "${SANITIZE_VALIDATE_TIMEOUT_SEC}" "$@"; then
+    return 0
+  else
+    command_rc="$?"
+    set_validate_fail_reason_by_rc "${command_rc}"
+    return 1
+  fi
+}
+
 validate_provider_file() {
   provider_input="$1"
   validate_dir="$2"
   validate_log="$3"
   validate_container="mihomo-validate-$$-$(date +%s)"
+  validate_fail_reason="unknown"
+
+  : > "${validate_log}"
 
   cat > "${validate_dir}/validate-config.yaml" <<'EOF'
 mixed-port: 7899
@@ -140,29 +211,51 @@ rules:
   - MATCH,P
 EOF
 
-  docker rm -f "${validate_container}" >/dev/null 2>&1 || true
+  cleanup_validate_container "${validate_container}"
 
-  docker create --name "${validate_container}" \
+  if ! run_validate_docker docker create --name "${validate_container}" \
     docker.io/metacubex/mihomo:latest \
     -d /root/.config/mihomo \
-    -f /root/.config/mihomo/validate-config.yaml >/dev/null
+    -f /root/.config/mihomo/validate-config.yaml >/dev/null; then
+    cleanup_validate_container "${validate_container}"
+    return 1
+  fi
 
-  docker cp "${provider_input}" "${validate_container}:/root/.config/mihomo/candidate.txt"
-  docker cp "${validate_dir}/validate-config.yaml" "${validate_container}:/root/.config/mihomo/validate-config.yaml"
-  docker start "${validate_container}" >/dev/null
+  if ! run_validate_docker docker cp "${provider_input}" "${validate_container}:/root/.config/mihomo/candidate.txt" >/dev/null; then
+    cleanup_validate_container "${validate_container}"
+    return 1
+  fi
+
+  if ! run_validate_docker docker cp "${validate_dir}/validate-config.yaml" "${validate_container}:/root/.config/mihomo/validate-config.yaml" >/dev/null; then
+    cleanup_validate_container "${validate_container}"
+    return 1
+  fi
+
+  if ! run_validate_docker docker start "${validate_container}" >/dev/null; then
+    cleanup_validate_container "${validate_container}"
+    return 1
+  fi
 
   sleep 1
-  docker logs "${validate_container}" > "${validate_log}" 2>&1 || true
-  docker rm -f "${validate_container}" >/dev/null 2>&1 || true
+
+  if ! run_validate_docker docker logs "${validate_container}" > "${validate_log}" 2>&1; then
+    cleanup_validate_container "${validate_container}"
+    return 1
+  fi
+
+  cleanup_validate_container "${validate_container}"
 
   if grep -Eqi 'proxy [0-9]+ error:|pull error:' "${validate_log}"; then
+    validate_fail_reason="proxy_error"
     return 1
   fi
 
   if grep -qi 'Initial configuration complete' "${validate_log}"; then
+    validate_fail_reason="ok"
     return 0
   fi
 
+  validate_fail_reason="unknown"
   return 1
 }
 
@@ -211,19 +304,140 @@ if [ ! -f "${ENV_FILE}" ]; then
   exit 1
 fi
 
-if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
-  log "Another sync is already running; skipping this cycle."
+acquire_lock() {
+  if mkdir "${LOCK_DIR}" 2>/dev/null; then
+    printf '%s\n' "$$" > "${LOCK_PID_FILE}" 2>/dev/null || true
+    LOCK_OWNED=1
+    return 0
+  fi
+
+  lock_pid=""
+  if [ -f "${LOCK_PID_FILE}" ]; then
+    lock_pid="$(cat "${LOCK_PID_FILE}" 2>/dev/null || true)"
+  fi
+
+  case "${lock_pid}" in
+    ''|*[!0-9]*)
+      lock_pid=""
+      ;;
+  esac
+
+  if [ -n "${lock_pid}" ] && kill -0 "${lock_pid}" >/dev/null 2>&1; then
+    log "Another sync is already running (pid=${lock_pid}); skipping this cycle."
+    return 1
+  fi
+
+  if [ -n "${lock_pid}" ]; then
+    log "Stale sync lock detected (pid=${lock_pid}), recovering lock."
+  else
+    log "Stale sync lock detected, recovering lock."
+  fi
+
+  if ! rm -rf "${LOCK_DIR}" 2>/dev/null; then
+    log "Failed to remove stale lock at ${LOCK_DIR}; skipping this cycle."
+    return 1
+  fi
+
+  if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+    log "Another sync acquired lock while recovering; skipping this cycle."
+    return 1
+  fi
+
+  printf '%s\n' "$$" > "${LOCK_PID_FILE}" 2>/dev/null || true
+  LOCK_OWNED=1
+  return 0
+}
+
+if ! acquire_lock; then
   exit 0
 fi
 
-cleanup() {
-  if [ -n "${TMP_DIR}" ]; then
-    rm -rf "${TMP_DIR}"
+list_child_pids() {
+  if [ -r "/proc/$$/task/$$/children" ]; then
+    child_line=""
+    IFS= read -r child_line < "/proc/$$/task/$$/children" || true
+    for pid in ${child_line}; do
+      printf '%s\n' "${pid}"
+    done
+    return 0
   fi
-  rmdir "${LOCK_DIR}" >/dev/null 2>&1 || true
+
+  ps -o pid= --ppid "$$" 2>/dev/null | awk '{print $1}' || true
 }
 
-trap cleanup EXIT INT TERM
+signal_children() {
+  signal_name="$1"
+  child_pids="$(list_child_pids)"
+  if [ -z "${child_pids}" ]; then
+    return 0
+  fi
+  # shellcheck disable=SC2086
+  kill -"${signal_name}" ${child_pids} >/dev/null 2>&1 || true
+}
+
+wait_children_exit() {
+  timeout_sec="$1"
+  waited=0
+  while [ "${waited}" -lt "${timeout_sec}" ]; do
+    child_pids="$(list_child_pids)"
+    if [ -z "${child_pids}" ]; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+cleanup_lock() {
+  if [ "${LOCK_CLEANED}" -eq 1 ]; then
+    return 0
+  fi
+  LOCK_CLEANED=1
+
+  if [ -n "${TMP_DIR}" ]; then
+    rm -rf "${TMP_DIR}"
+    TMP_DIR=""
+  fi
+
+  if [ "${LOCK_OWNED}" -ne 1 ]; then
+    return 0
+  fi
+
+  lock_pid=""
+  if [ -f "${LOCK_PID_FILE}" ]; then
+    lock_pid="$(cat "${LOCK_PID_FILE}" 2>/dev/null || true)"
+  fi
+
+  if [ -n "${lock_pid}" ] && [ "${lock_pid}" != "$$" ]; then
+    log "Lock ownership changed to pid=${lock_pid}; keeping ${LOCK_DIR}."
+    return 0
+  fi
+
+  rm -f "${LOCK_PID_FILE}" >/dev/null 2>&1 || true
+  rm -rf "${LOCK_DIR}" >/dev/null 2>&1 || true
+}
+
+on_interrupt() {
+  signal_name="$1"
+  if [ "${INTERRUPTING}" -eq 1 ]; then
+    exit 130
+  fi
+  INTERRUPTING=1
+  log "Received ${signal_name}; terminating child processes and releasing lock."
+
+  signal_children TERM
+  if ! wait_children_exit "${INTERRUPT_GRACE_SEC}"; then
+    signal_children KILL
+  fi
+
+  cleanup_lock
+  exit 130
+}
+
+trap cleanup_lock EXIT
+trap 'on_interrupt INT' INT
+trap 'on_interrupt TERM' TERM
 
 # shellcheck disable=SC1090
 set -a
@@ -237,6 +451,26 @@ SANITIZE_INTERVAL="${SANITIZE_INTERVAL:-300}"
 MIN_VALID_PROXIES="${MIN_VALID_PROXIES:-1}"
 SANITIZE_ALLOW_PROTOCOLS="${SANITIZE_ALLOW_PROTOCOLS:-vless,trojan,ss,vmess}"
 SANITIZE_LOG_JSON="${SANITIZE_LOG_JSON:-true}"
+SANITIZE_VALIDATE_TIMEOUT_SEC="${SANITIZE_VALIDATE_TIMEOUT_SEC:-10}"
+SANITIZE_VALIDATE_MAX_ITERATIONS="${SANITIZE_VALIDATE_MAX_ITERATIONS:-80}"
+
+case "${SANITIZE_VALIDATE_TIMEOUT_SEC}" in
+  ''|*[!0-9]*)
+    SANITIZE_VALIDATE_TIMEOUT_SEC=10
+    ;;
+esac
+if [ "${SANITIZE_VALIDATE_TIMEOUT_SEC}" -le 0 ]; then
+  SANITIZE_VALIDATE_TIMEOUT_SEC=10
+fi
+
+case "${SANITIZE_VALIDATE_MAX_ITERATIONS}" in
+  ''|*[!0-9]*)
+    SANITIZE_VALIDATE_MAX_ITERATIONS=80
+    ;;
+esac
+if [ "${SANITIZE_VALIDATE_MAX_ITERATIONS}" -le 0 ]; then
+  SANITIZE_VALIDATE_MAX_ITERATIONS=80
+fi
 
 mkdir -p "${PROVIDER_DIR}"
 if [ ! -f "${PROVIDER_FILE}" ]; then
@@ -390,7 +624,11 @@ if [ -n "${single_yaml_mode}" ] && [ "${source_total}" -eq 1 ]; then
     log "Single-source YAML subscription synced (${single_yaml_mode})."
   else
     existing_count="$(count_provider_lines)"
-    write_status "degraded_direct" "yaml_validation_error" "${raw_count}" "${filtered_count}" "${existing_count}" "${dropped_count}" "${single_yaml_mode}" "direct" "${source_urls_joined}" "${source_total}" "${source_ok}" "${source_failed}" "${excluded_by_country}"
+    degraded_reason="yaml_validation_error"
+    if [ "${validate_fail_reason}" = "timeout" ]; then
+      degraded_reason="validation_timeout"
+    fi
+    write_status "degraded_direct" "${degraded_reason}" "${raw_count}" "${filtered_count}" "${existing_count}" "${dropped_count}" "${single_yaml_mode}" "direct" "${source_urls_joined}" "${source_total}" "${source_ok}" "${source_failed}" "${excluded_by_country}"
     log "Single-source YAML validation failed, keeping previous provider file."
   fi
   exit 0
@@ -531,8 +769,25 @@ fi
 
 cp "${COUNTRY_FILTERED_FILE}" "${WORKING_FILE}"
 
+validation_timeout_hit=0
+validation_iteration_cap_hit=0
+validation_iterations=0
+
 while :; do
+  validation_iterations=$((validation_iterations + 1))
+  if [ "${validation_iterations}" -gt "${SANITIZE_VALIDATE_MAX_ITERATIONS}" ]; then
+    validation_iteration_cap_hit=1
+    log "Validation iteration limit reached (${SANITIZE_VALIDATE_MAX_ITERATIONS}), aborting sanitize loop."
+    break
+  fi
+
   if validate_provider_file "${WORKING_FILE}" "${TMP_DIR}" "${VALIDATE_LOG}"; then
+    break
+  fi
+
+  if [ "${validate_fail_reason}" = "timeout" ]; then
+    validation_timeout_hit=1
+    log "Validation timed out after ${SANITIZE_VALIDATE_TIMEOUT_SEC}s, aborting sanitize loop."
     break
   fi
 
@@ -572,7 +827,16 @@ if [ "${dropped_count}" -lt 0 ]; then
   dropped_count=0
 fi
 
-if [ "${valid_count}" -ge "${MIN_VALID_PROXIES}" ] && validate_provider_file "${WORKING_FILE}" "${TMP_DIR}" "${VALIDATE_LOG}"; then
+final_validation_ok=0
+if [ "${validation_timeout_hit}" -eq 0 ] && [ "${validation_iteration_cap_hit}" -eq 0 ] && [ "${valid_count}" -ge "${MIN_VALID_PROXIES}" ]; then
+  if validate_provider_file "${WORKING_FILE}" "${TMP_DIR}" "${VALIDATE_LOG}"; then
+    final_validation_ok=1
+  elif [ "${validate_fail_reason}" = "timeout" ]; then
+    validation_timeout_hit=1
+  fi
+fi
+
+if [ "${final_validation_ok}" -eq 1 ]; then
   cp "${WORKING_FILE}" "${TMP_DIR}/provider.new"
   mv "${TMP_DIR}/provider.new" "${PROVIDER_FILE}"
   fix_owner "${PROVIDER_FILE}"
@@ -583,6 +847,12 @@ if [ "${valid_count}" -ge "${MIN_VALID_PROXIES}" ] && validate_provider_file "${
   log "Subscription synced: raw=${raw_count} filtered=${filtered_count} excluded_by_country=${excluded_by_country} valid=${valid_count} dropped=${dropped_count} throughput_ranked=${throughput_ranked} throughput_reason=${throughput_reason}."
 else
   existing_count="$(count_provider_lines)"
-  write_status "degraded_direct" "validation_failed_or_not_enough_proxies" "${raw_count}" "${filtered_count}" "${existing_count}" "${dropped_count}" "${mode}" "direct" "${source_urls_joined}" "${source_total}" "${source_ok}" "${source_failed}" "${excluded_by_country}"
+  degraded_reason="validation_failed_or_not_enough_proxies"
+  if [ "${validation_timeout_hit}" -eq 1 ]; then
+    degraded_reason="validation_timeout"
+  elif [ "${validation_iteration_cap_hit}" -eq 1 ]; then
+    degraded_reason="validation_iteration_limit"
+  fi
+  write_status "degraded_direct" "${degraded_reason}" "${raw_count}" "${filtered_count}" "${existing_count}" "${dropped_count}" "${mode}" "direct" "${source_urls_joined}" "${source_total}" "${source_ok}" "${source_failed}" "${excluded_by_country}"
   log "Validation failed or too few valid proxies, keeping previous provider file."
 fi

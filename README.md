@@ -70,6 +70,8 @@ cp .env.example .env
 | `SANITIZE_ALLOW_PROTOCOLS` | нет | `vless,trojan,ss,vmess` | разрешённые протоколы |
 | `EXCLUDE_COUNTRIES` | нет | `RU,BY` | исключаемые страны (ISO2) |
 | `SANITIZE_LOG_JSON` | нет | `true` | печатать JSON статуса в лог sync |
+| `SANITIZE_VALIDATE_TIMEOUT_SEC` | нет | `10` | timeout (сек) на один docker-шаг валидации провайдера |
+| `SANITIZE_VALIDATE_MAX_ITERATIONS` | нет | `80` | максимум итераций удаления битых прокси в одном sync |
 | `THROUGHPUT_ENABLE` | нет | `true` | включить throughput ranking |
 | `THROUGHPUT_TOP_N` | нет | `50` | сколько ping-best прокси тестировать по скорости |
 | `THROUGHPUT_TEST_URL` | нет | `https://speed.cloudflare.com/__down?bytes=5000000` | URL для speed test |
@@ -129,9 +131,13 @@ journalctl -u mihomo-gateway.service -n 100 --no-pager
 
 - `reason=all_sources_failed`: источники не скачались, проверь URL/доступ к GitHub.
 - `reason=validation_failed_or_not_enough_proxies`: после санитизации не осталось валидного минимума.
+- `reason=validation_timeout`: валидация прокси превысила `SANITIZE_VALIDATE_TIMEOUT_SEC`.
+- `reason=validation_iteration_limit`: достигнут лимит `SANITIZE_VALIDATE_MAX_ITERATIONS` в цикле санитизации.
 - `throughput_reason=api_unreachable`: Mihomo controller недоступен на `API_BIND`.
 - `throughput_reason=tools_missing`: в sync-окружении нет `curl/jq`.
 - `status=degraded_direct`: актуальный валидный provider недоступен, используется safe-degraded режим.
+- При `Ctrl+C` в `./scripts/validate-config.sh` или `./scripts/up.sh` sync-lock чистится автоматически.
+- Если lock был создан другим UID (например, root), очисти его тем же пользователем: `sudo rm -rf runtime/.sync.lock`.
 
 ## Архитектура
 

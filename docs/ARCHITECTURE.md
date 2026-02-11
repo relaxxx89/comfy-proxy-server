@@ -41,6 +41,8 @@
 
 - Если новый sync невалиден, текущий рабочий provider не затирается.
 - При полном провале источников фиксируется `status=degraded_direct`.
+- Цикл удаления битых узлов ограничен `SANITIZE_VALIDATE_TIMEOUT_SEC` и `SANITIZE_VALIDATE_MAX_ITERATIONS` для предсказуемого времени завершения sync.
+- При `SIGINT`/`SIGTERM` sync и его обертки завершают дочерние процессы и освобождают lock по PID владельца.
 - Failover в рантайме обрабатывается `AUTO_FAILSAFE`.
 
 ## Пути и переносимость
