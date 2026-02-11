@@ -80,6 +80,8 @@ cp .env.example .env
 | `THROUGHPUT_TEST_URL` | нет | `https://speed.cloudflare.com/__down?bytes=5000000` | URL для speed test |
 | `THROUGHPUT_TIMEOUT_SEC` | нет | `12` | timeout speed test на прокси |
 | `THROUGHPUT_MIN_KBPS` | нет | `50` | минимум скорости для попадания в ranked |
+| `THROUGHPUT_SAMPLES` | нет | `3` | сколько speed-замеров делать на один прокси |
+| `THROUGHPUT_REQUIRED_SUCCESSES` | нет | `2` | минимум успешных замеров (>= `THROUGHPUT_MIN_KBPS`) для включения прокси в ranked |
 
 ## Команды эксплуатации
 
@@ -139,8 +141,28 @@ journalctl -u mihomo-gateway.service -n 100 --no-pager
 - `reason=no_quality_proxies`: quality filter отфильтровал все узлы, проверь `SANITIZE_EXCLUDE_HOST_PATTERNS` и качество источника.
 - `throughput_reason=api_unreachable`: Mihomo controller недоступен на `API_BIND`.
 - `throughput_reason=tools_missing`: в sync-окружении нет `curl/jq`.
+- `throughput_reason=bench_unavailable`: в текущем runtime-конфиге группа `PROXY` не содержит `BENCH`; перерендери конфиг (`./scripts/validate-config.sh` или `./scripts/up.sh`).
 - `status=degraded_direct`: актуальный валидный provider недоступен, используется safe-degraded режим.
 - `BENCH` — служебная группа для ranking; пользовательский трафик должен идти через `AUTO_FAILSAFE`/`AUTO_SPEED`.
+- Если в логах много `dial PROXY ... context deadline exceeded`, проверь текущую группу через controller API (обязательно без прокси-переменных):
+```bash
+API_SECRET="$(awk -F= '/^API_SECRET=/{print $2}' .env)"
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
+  curl --noproxy '*' --silent --show-error --fail \
+  -H "Authorization: Bearer ${API_SECRET}" \
+  http://127.0.0.1:9090/proxies/PROXY | jq -r '.now'
+```
+- Если вернулось `BENCH`, восстанови `AUTO_FAILSAFE` вручную:
+```bash
+API_SECRET="$(awk -F= '/^API_SECRET=/{print $2}' .env)"
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
+  curl --noproxy '*' --silent --show-error --fail \
+  -X PUT \
+  -H "Authorization: Bearer ${API_SECRET}" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"AUTO_FAILSAFE"}' \
+  http://127.0.0.1:9090/proxies/PROXY
+```
 - При `Ctrl+C` в `./scripts/validate-config.sh` или `./scripts/up.sh` sync-lock чистится автоматически.
 - Если lock был создан другим UID (например, root), очисти его тем же пользователем: `sudo rm -rf runtime/.sync.lock`.
 

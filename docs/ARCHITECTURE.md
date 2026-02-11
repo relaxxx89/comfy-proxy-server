@@ -26,18 +26,21 @@
 
 3. `scripts/rank-throughput.sh`
    - берет кандидатов по ping history (`TOP_N`)
-   - переключает `PROXY` на `BENCH`
-   - меряет `speed_download` через локальный proxy port
-   - всегда восстанавливает `PROXY` из `BENCH` при любом завершении (EXIT/INT/TERM)
+   - перед тестом санитизирует цель восстановления (`BENCH`/`DIRECT` запрещены как final target)
+   - переключает `PROXY` на `BENCH` только на время измерений
+   - меряет `speed_download` через локальный proxy port в несколько проходов (`THROUGHPUT_SAMPLES`)
+   - считает медиану успешных замеров и требует минимум `THROUGHPUT_REQUIRED_SUCCESSES`
+   - всегда восстанавливает `PROXY` при любом завершении (EXIT/INT/TERM), с fallback в `AUTO_FAILSAFE`
    - сортирует по throughput и перестраивает порядок в
      `runtime/proxy_providers/main-subscription-ranked.yaml`
+   - если `PROXY` оказался в `BENCH`, sync делает auto-heal в `AUTO_FAILSAFE`
 
 ## Группы в Mihomo
 
 - `AUTO_SPEED` (`url-test`): выбирает лучший узел по задержке.
 - `AUTO_FAILSAFE` (`fallback`): быстрый failover при проблемах с текущим узлом.
-- `BENCH` (`select`): служебная группа для throughput-тестов.
-- `PROXY` (`select`): верхнеуровневая группа для клиентского трафика (`AUTO_FAILSAFE` -> `AUTO_SPEED` -> `DIRECT`).
+- `BENCH` (`select`): служебная группа для throughput-тестов, не для постоянного user traffic.
+- `PROXY` (`select`): верхнеуровневая группа для клиентского трафика (`AUTO_FAILSAFE` -> `AUTO_SPEED` -> `DIRECT`, `BENCH` как служебный fallback для ranking).
 
 ## Деградация и отказоустойчивость
 
@@ -46,6 +49,7 @@
 - Цикл удаления битых узлов ограничен `SANITIZE_VALIDATE_TIMEOUT_SEC` и `SANITIZE_VALIDATE_MAX_ITERATIONS` для предсказуемого времени завершения sync.
 - При `SIGINT`/`SIGTERM` sync и его обертки завершают дочерние процессы и освобождают lock по PID владельца.
 - Failover в рантайме обрабатывается `AUTO_FAILSAFE`.
+- Если `PROXY` по ошибке залипает в `BENCH`, post-rank guard возвращает `AUTO_FAILSAFE`.
 
 ## Пути и переносимость
 

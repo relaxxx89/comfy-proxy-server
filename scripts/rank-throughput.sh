@@ -43,6 +43,8 @@ THROUGHPUT_TOP_N="${THROUGHPUT_TOP_N:-50}"
 THROUGHPUT_TEST_URL="${THROUGHPUT_TEST_URL:-https://speed.cloudflare.com/__down?bytes=5000000}"
 THROUGHPUT_TIMEOUT_SEC="${THROUGHPUT_TIMEOUT_SEC:-12}"
 THROUGHPUT_MIN_KBPS="${THROUGHPUT_MIN_KBPS:-50}"
+THROUGHPUT_SAMPLES="${THROUGHPUT_SAMPLES:-3}"
+THROUGHPUT_REQUIRED_SUCCESSES="${THROUGHPUT_REQUIRED_SUCCESSES:-0}"
 PROXY_PORT="${PROXY_PORT:-7890}"
 PROXY_AUTH="${PROXY_AUTH:-}"
 API_BIND="${API_BIND:-127.0.0.1:9090}"
@@ -97,9 +99,31 @@ if [ "${THROUGHPUT_MIN_KBPS}" -lt 0 ]; then
   THROUGHPUT_MIN_KBPS=0
 fi
 
+case "${THROUGHPUT_SAMPLES}" in
+  ''|*[!0-9]*)
+    THROUGHPUT_SAMPLES=3
+    ;;
+esac
+if [ "${THROUGHPUT_SAMPLES}" -le 0 ]; then
+  THROUGHPUT_SAMPLES=3
+fi
+
+case "${THROUGHPUT_REQUIRED_SUCCESSES}" in
+  ''|*[!0-9]*)
+    THROUGHPUT_REQUIRED_SUCCESSES=0
+    ;;
+esac
+if [ "${THROUGHPUT_REQUIRED_SUCCESSES}" -le 0 ] || [ "${THROUGHPUT_REQUIRED_SUCCESSES}" -gt "${THROUGHPUT_SAMPLES}" ]; then
+  THROUGHPUT_REQUIRED_SUCCESSES=$((THROUGHPUT_SAMPLES / 2 + 1))
+fi
+
 MIN_BPS=$((THROUGHPUT_MIN_KBPS * 1024))
 TMP_DIR="$(mktemp -d "${ROOT_DIR}/runtime/rank.XXXXXX")"
-current_proxy="AUTO_SPEED"
+PROXY_STATE_FILE="${TMP_DIR}/proxy-state.json"
+PROXY_ALL_FILE="${TMP_DIR}/proxy-all.txt"
+CANDIDATE_SPEEDS_FILE="${TMP_DIR}/candidate-speeds.txt"
+current_proxy="AUTO_FAILSAFE"
+restore_target="AUTO_FAILSAFE"
 proxy_switched_to_bench=0
 cleanup_done=0
 
@@ -146,12 +170,34 @@ api_call() {
   fi
 }
 
+sanitize_restore_target() {
+  candidate="$1"
+
+  case "${candidate}" in
+    ''|BENCH|DIRECT)
+      printf 'AUTO_FAILSAFE\n'
+      return 0
+      ;;
+  esac
+
+  if [ ! -s "${PROXY_ALL_FILE}" ]; then
+    printf 'AUTO_FAILSAFE\n'
+    return 0
+  fi
+
+  if grep -Fxq "${candidate}" "${PROXY_ALL_FILE}" 2>/dev/null; then
+    printf '%s\n' "${candidate}"
+  else
+    printf 'AUTO_FAILSAFE\n'
+  fi
+}
+
 restore_proxy_group() {
   if [ "${proxy_switched_to_bench}" -ne 1 ]; then
     return 0
   fi
 
-  escaped_proxy="$(printf '%s' "${current_proxy}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+  escaped_proxy="$(printf '%s' "${restore_target}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
   restore_payload="$(printf '{"name":"%s"}' "${escaped_proxy}")"
   api_call PUT "/proxies/PROXY" "${restore_payload}" > /dev/null 2>&1 || true
   proxy_switched_to_bench=0
@@ -207,8 +253,23 @@ if [ ! -s "${CANDIDATES_FILE}" ]; then
 fi
 
 CURRENT_PROXY_FILE="${TMP_DIR}/current_proxy.txt"
-api_call GET "/proxies/PROXY" | jq -r '.now // "AUTO_SPEED"' > "${CURRENT_PROXY_FILE}" 2>/dev/null || echo "AUTO_SPEED" > "${CURRENT_PROXY_FILE}"
+if api_call GET "/proxies/PROXY" > "${PROXY_STATE_FILE}" 2>/dev/null; then
+  jq -r '.now // "AUTO_FAILSAFE"' "${PROXY_STATE_FILE}" > "${CURRENT_PROXY_FILE}" 2>/dev/null || echo "AUTO_FAILSAFE" > "${CURRENT_PROXY_FILE}"
+  jq -r '.all[]?' "${PROXY_STATE_FILE}" > "${PROXY_ALL_FILE}" 2>/dev/null || : > "${PROXY_ALL_FILE}"
+else
+  echo "AUTO_FAILSAFE" > "${CURRENT_PROXY_FILE}"
+  : > "${PROXY_ALL_FILE}"
+fi
 current_proxy="$(cat "${CURRENT_PROXY_FILE}")"
+restore_target="$(sanitize_restore_target "${current_proxy}")"
+
+if [ "${current_proxy}" = "BENCH" ]; then
+  heal_payload="$(jq -cn --arg name "AUTO_FAILSAFE" '{name:$name}')"
+  if api_call PUT "/proxies/PROXY" "${heal_payload}" > /dev/null 2>&1; then
+    current_proxy="AUTO_FAILSAFE"
+    restore_target="AUTO_FAILSAFE"
+  fi
+fi
 
 proxy_switch_payload="$(jq -cn --arg name "BENCH" '{name:$name}')"
 if ! api_call PUT "/proxies/PROXY" "${proxy_switch_payload}" > /dev/null 2>&1; then
@@ -231,37 +292,77 @@ while IFS= read -r candidate; do
     continue
   fi
 
-  if [ -n "${PROXY_AUTH}" ]; then
-    speed_raw="$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
-      curl --silent --show-error \
-      --proxy "http://127.0.0.1:${PROXY_PORT}" \
-      --proxy-user "${PROXY_AUTH}" \
-      --max-time "${THROUGHPUT_TIMEOUT_SEC}" \
-      --connect-timeout 5 \
-      --location \
-      --output /dev/null \
-      --write-out '%{speed_download}' \
-      "${THROUGHPUT_TEST_URL}" 2>/dev/null || true)"
-  else
-    speed_raw="$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
-      curl --silent --show-error \
-      --proxy "http://127.0.0.1:${PROXY_PORT}" \
-      --max-time "${THROUGHPUT_TIMEOUT_SEC}" \
-      --connect-timeout 5 \
-      --location \
-      --output /dev/null \
-      --write-out '%{speed_download}' \
-      "${THROUGHPUT_TEST_URL}" 2>/dev/null || true)"
+  : > "${CANDIDATE_SPEEDS_FILE}"
+  sample_index=1
+  while [ "${sample_index}" -le "${THROUGHPUT_SAMPLES}" ]; do
+    if [ -n "${PROXY_AUTH}" ]; then
+      speed_raw="$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
+        curl --silent --show-error \
+        --proxy "http://127.0.0.1:${PROXY_PORT}" \
+        --proxy-user "${PROXY_AUTH}" \
+        --max-time "${THROUGHPUT_TIMEOUT_SEC}" \
+        --connect-timeout 5 \
+        --location \
+        --output /dev/null \
+        --write-out '%{speed_download}' \
+        "${THROUGHPUT_TEST_URL}" 2>/dev/null || true)"
+    else
+      speed_raw="$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
+        curl --silent --show-error \
+        --proxy "http://127.0.0.1:${PROXY_PORT}" \
+        --max-time "${THROUGHPUT_TIMEOUT_SEC}" \
+        --connect-timeout 5 \
+        --location \
+        --output /dev/null \
+        --write-out '%{speed_download}' \
+        "${THROUGHPUT_TEST_URL}" 2>/dev/null || true)"
+    fi
+
+    if printf '%s' "${speed_raw}" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
+      speed_bps="$(awk -v s="${speed_raw}" 'BEGIN {printf "%.0f\n", s}')"
+      if [ "${speed_bps}" -ge "${MIN_BPS}" ]; then
+        printf '%s\n' "${speed_bps}" >> "${CANDIDATE_SPEEDS_FILE}"
+      fi
+    fi
+
+    sample_index=$((sample_index + 1))
+  done
+
+  candidate_successes="$(wc -l < "${CANDIDATE_SPEEDS_FILE}" | tr -d ' ')"
+  if [ "${candidate_successes}" -lt "${THROUGHPUT_REQUIRED_SUCCESSES}" ]; then
+    throughput_failed=$((throughput_failed + 1))
+    continue
   fi
 
-  if printf '%s' "${speed_raw}" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
-    speed_bps="$(awk -v s="${speed_raw}" 'BEGIN {printf "%.0f\n", s}')"
-    if [ "${speed_bps}" -ge "${MIN_BPS}" ]; then
-      printf '%s\t%s\n' "${speed_bps}" "${candidate}" >> "${SCORES_FILE}"
-      throughput_ranked=$((throughput_ranked + 1))
-    else
+  candidate_score="$(sort -n "${CANDIDATE_SPEEDS_FILE}" | awk '
+  {
+    vals[++n] = $1
+  }
+  END {
+    if (n == 0) {
+      print 0
+      exit
+    }
+    if ((n % 2) == 1) {
+      idx = (n + 1) / 2
+      print vals[idx]
+      exit
+    }
+    idx = n / 2
+    print int((vals[idx] + vals[idx + 1]) / 2)
+  }'
+  )"
+
+  case "${candidate_score}" in
+    ''|*[!0-9]*)
       throughput_failed=$((throughput_failed + 1))
-    fi
+      continue
+      ;;
+  esac
+
+  if [ "${candidate_score}" -ge "${MIN_BPS}" ]; then
+    printf '%s\t%s\n' "${candidate_score}" "${candidate}" >> "${SCORES_FILE}"
+    throughput_ranked=$((throughput_ranked + 1))
   else
     throughput_failed=$((throughput_failed + 1))
   fi

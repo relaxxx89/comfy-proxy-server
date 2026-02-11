@@ -299,6 +299,69 @@ EOF
   fix_owner "${RANKED_PROVIDER_FILE}"
 }
 
+controller_api_call() {
+  method="$1"
+  endpoint="$2"
+  body="${3:-}"
+  api_base="http://${API_BIND:-127.0.0.1:9090}"
+
+  if [ -n "${API_SECRET:-}" ]; then
+    if [ -n "${body}" ]; then
+      env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
+        curl --noproxy '*' --silent --show-error --fail \
+        -X "${method}" \
+        -H "Authorization: Bearer ${API_SECRET}" \
+        -H "Content-Type: application/json" \
+        -d "${body}" \
+        "${api_base}${endpoint}"
+    else
+      env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
+        curl --noproxy '*' --silent --show-error --fail \
+        -X "${method}" \
+        -H "Authorization: Bearer ${API_SECRET}" \
+        "${api_base}${endpoint}"
+    fi
+  else
+    if [ -n "${body}" ]; then
+      env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
+        curl --noproxy '*' --silent --show-error --fail \
+        -X "${method}" \
+        -H "Content-Type: application/json" \
+        -d "${body}" \
+        "${api_base}${endpoint}"
+    else
+      env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
+        curl --noproxy '*' --silent --show-error --fail \
+        -X "${method}" \
+        "${api_base}${endpoint}"
+    fi
+  fi
+}
+
+ensure_proxy_not_bench() {
+  if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    return 0
+  fi
+
+  proxy_state="$(controller_api_call GET "/proxies/PROXY" 2>/dev/null || true)"
+  if [ -z "${proxy_state}" ]; then
+    return 0
+  fi
+
+  proxy_now="$(printf '%s' "${proxy_state}" | jq -r '.now // ""' 2>/dev/null || true)"
+  if [ "${proxy_now}" != "BENCH" ]; then
+    return 0
+  fi
+
+  restore_payload='{"name":"AUTO_FAILSAFE"}'
+  if controller_api_call PUT "/proxies/PROXY" "${restore_payload}" >/dev/null 2>&1; then
+    log "Detected PROXY=BENCH after ranking; restored to AUTO_FAILSAFE."
+  else
+    log "Detected PROXY=BENCH after ranking; failed to restore AUTO_FAILSAFE."
+  fi
+  return 0
+}
+
 if [ ! -f "${ENV_FILE}" ]; then
   echo "Missing ${ENV_FILE}. Copy .env.example to .env and fill required values." >&2
   exit 1
@@ -645,6 +708,7 @@ if [ -n "${single_yaml_mode}" ] && [ "${source_total}" -eq 1 ]; then
     cp "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
     fix_owner "${RANKED_PROVIDER_FILE}"
     run_throughput_ranking
+    ensure_proxy_not_bench
     write_status "healthy" "ok" "${raw_count}" "${filtered_count}" "${valid_count}" "${dropped_count}" "${single_yaml_mode}" "" "${source_urls_joined}" "${source_total}" "${source_ok}" "${source_failed}" "${excluded_by_country}"
     log "Single-source YAML subscription synced (${single_yaml_mode})."
   else
@@ -998,6 +1062,7 @@ if [ "${final_validation_ok}" -eq 1 ]; then
   cp "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
   fix_owner "${RANKED_PROVIDER_FILE}"
   run_throughput_ranking
+  ensure_proxy_not_bench
   write_status "healthy" "ok" "${raw_count}" "${filtered_count}" "${valid_count}" "${dropped_count}" "${mode}" "" "${source_urls_joined}" "${source_total}" "${source_ok}" "${source_failed}" "${excluded_by_country}"
   log "Subscription synced: raw=${raw_count} filtered=${filtered_count} excluded_by_country=${excluded_by_country} valid=${valid_count} dropped=${dropped_count} throughput_ranked=${throughput_ranked} throughput_reason=${throughput_reason}."
 else

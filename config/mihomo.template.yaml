@@ -65,6 +65,7 @@ proxy-groups:
       - AUTO_FAILSAFE
       - AUTO_SPEED
       - DIRECT
+      - BENCH
 
 rules:
   - MATCH,PROXY
