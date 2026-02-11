@@ -23,7 +23,7 @@
 ## Быстрый старт
 
 ```bash
-git clone <your-repo-url> proxy-server
+git clone https://github.com/relaxxx89/comfy-proxy-server proxy-server
 cd proxy-server
 cp .env.example .env
 ```
