@@ -7,9 +7,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/home/stepan/Documents/proxy-server
-ExecStart=/home/stepan/Documents/proxy-server/scripts/up.sh
-ExecStop=/home/stepan/Documents/proxy-server/scripts/down.sh
+WorkingDirectory=__PROJECT_DIR__
+ExecStart=__PROJECT_DIR__/scripts/up.sh
+ExecStop=__PROJECT_DIR__/scripts/down.sh
 TimeoutStartSec=120
 TimeoutStopSec=60
 

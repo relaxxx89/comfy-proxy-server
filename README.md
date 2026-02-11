@@ -1,100 +1,138 @@
 # Mihomo LAN Proxy Gateway
 
-Local proxy gateway with:
-- GitHub subscription sync with strict sanitization
-- multi-source subscriptions merge (best-effort)
-- country exclusion filter (for example `RU`)
-- automatic speed-based selection (`url-test`)
-- throughput-based re-ranking after sync (`top-N` by ping then Mbps test)
-- automatic failover (`fallback`)
-- one stable LAN endpoint for all client devices
-- degradation mode to `DIRECT` when subscription is broken (with explicit status)
+Локальный прокси-шлюз на базе Mihomo с авто-синхронизацией подписок, фильтрацией, автофейловером и ранжированием по скорости.
 
-## 1. Configure
+## Что умеет
+
+- синхронизация подписок из GitHub/raw URL
+- поддержка нескольких подписок (`SUBSCRIPTION_URLS`)
+- строгая санитизация и валидация прокси-листа
+- исключение стран (например, `EXCLUDE_COUNTRIES=RU`)
+- авто-выбор по задержке (`AUTO_SPEED`, `url-test`)
+- авто-переключение при падении (`AUTO_FAILSAFE`, `fallback`)
+- ранжирование по throughput после успешного sync
+- единая LAN-точка для клиентов (`http/socks5` на одном порту)
+
+## Требования
+
+- Linux хост
+- Docker + Docker Compose plugin
+- `curl` на хосте (для `scripts/test-proxy.sh`)
+- `systemd` (опционально, только если нужен автозапуск как сервис)
+
+## Быстрый старт
 
 ```bash
-cd /home/stepan/Documents/proxy-server
+git clone <your-repo-url> proxy-server
+cd proxy-server
 cp .env.example .env
 ```
 
-Edit `.env`:
-- `SUBSCRIPTION_URLS`: CSV list of GitHub/raw URLs (preferred)
-- `SUBSCRIPTION_URL`: legacy single URL fallback when `SUBSCRIPTION_URLS` is empty
-- `PROXY_AUTH`: proxy credentials (`username:password`)
-- `LAN_BIND_IP`: use host LAN IP for tighter exposure, or `0.0.0.0`
-- `API_SECRET`: controller API secret
-- `SANITIZE_ALLOW_PROTOCOLS`: default `vless,trojan,ss,vmess`
-- `EXCLUDE_COUNTRIES`: CSV ISO2 list to remove countries (example: `RU,BY`)
-- `SANITIZE_INTERVAL`: periodic sync interval for worker container
-- `THROUGHPUT_ENABLE`: enable/disable throughput ranking
-- `THROUGHPUT_TOP_N`: how many ping-best proxies are throughput tested (default `50`)
-- `THROUGHPUT_TEST_URL`: download URL used for speed test
-- `THROUGHPUT_TIMEOUT_SEC`: per-proxy speed test timeout
-- `THROUGHPUT_MIN_KBPS`: minimum speed to be considered ranked
-
-## 2. Validate config
+1. Отредактируй `.env`.
+2. Проверь конфиг:
 
 ```bash
 ./scripts/validate-config.sh
 ```
 
-This runs:
-1. render `runtime/config.yaml`
-2. sync and sanitize subscription into `runtime/proxy_providers/main-subscription.yaml`
-3. test final Mihomo config with `mihomo -t`
-
-## 3. Start
+3. Запусти сервис:
 
 ```bash
 ./scripts/up.sh
 ```
 
-This starts two services:
-- `mihomo`: LAN proxy gateway
-- `subscription-sync`: background sync/cleanup worker
-
-## 4. Client setup
-
-Point devices to:
-- HTTP proxy: `http://<server-lan-ip>:7890`
-- SOCKS5 proxy: `<server-lan-ip>:7890`
-- auth: value from `PROXY_AUTH`
-
-## 5. Verify traffic goes through proxy
+4. Проверь статус:
 
 ```bash
-./scripts/test-proxy.sh
+./scripts/status.sh
 ```
 
-You should see external IP printed.
+## Настройка `.env`
 
-## 6. Operations
+| Переменная | Обязательна | Пример | Назначение |
+|---|---|---|---|
+| `SUBSCRIPTION_URLS` | нет | `https://.../a.txt,https://.../b.txt` | CSV список источников (предпочтительно) |
+| `SUBSCRIPTION_URL` | да | `https://.../single.txt` | fallback-источник, если `SUBSCRIPTION_URLS` пуст |
+| `LAN_BIND_IP` | да | `0.0.0.0` | bind адрес прокси на хосте |
+| `PROXY_PORT` | да | `7890` | порт HTTP/SOCKS прокси |
+| `PROXY_AUTH` | да | `user:pass` | авторизация на прокси |
+| `API_BIND` | да | `127.0.0.1:9090` | bind address контроллера Mihomo |
+| `API_SECRET` | да | `change_me` | секрет контроллера |
+| `MIHOMO_LOG_LEVEL` | да | `info` | уровень логирования |
+| `HEALTHCHECK_URL` | да | `https://www.gstatic.com/generate_204` | URL для health-check |
+| `HEALTHCHECK_INTERVAL` | да | `180` | интервал health-check провайдеров |
+| `HEALTHCHECK_TIMEOUT` | да | `5000` | timeout health-check (ms) |
+| `URL_TEST_INTERVAL` | да | `180` | интервал `AUTO_SPEED` |
+| `URL_TEST_TOLERANCE` | да | `50` | tolerance для `AUTO_SPEED` |
+| `FALLBACK_INTERVAL` | да | `90` | интервал `AUTO_FAILSAFE` |
+| `SANITIZE_INTERVAL` | нет | `300` | период sync worker (сек) |
+| `MIN_VALID_PROXIES` | нет | `1` | минимум валидных прокси для принятия листа |
+| `SANITIZE_ALLOW_PROTOCOLS` | нет | `vless,trojan,ss,vmess` | разрешённые протоколы |
+| `EXCLUDE_COUNTRIES` | нет | `RU,BY` | исключаемые страны (ISO2) |
+| `SANITIZE_LOG_JSON` | нет | `true` | печатать JSON статуса в лог sync |
+| `THROUGHPUT_ENABLE` | нет | `true` | включить throughput ranking |
+| `THROUGHPUT_TOP_N` | нет | `50` | сколько ping-best прокси тестировать по скорости |
+| `THROUGHPUT_TEST_URL` | нет | `https://speed.cloudflare.com/__down?bytes=5000000` | URL для speed test |
+| `THROUGHPUT_TIMEOUT_SEC` | нет | `12` | timeout speed test на прокси |
+| `THROUGHPUT_MIN_KBPS` | нет | `50` | минимум скорости для попадания в ranked |
+
+## Команды эксплуатации
 
 ```bash
-./scripts/status.sh           # last subscription sync status
-./scripts/sync-subscription.sh # force sync now
-./scripts/logs.sh             # follow logs for mihomo + subscription worker
-./scripts/down.sh             # stop all services
+./scripts/up.sh                 # рендер + sync + запуск контейнеров
+./scripts/down.sh               # остановка контейнеров
+./scripts/logs.sh               # логи mihomo и sync worker
+./scripts/status.sh             # краткий статус последнего sync
+./scripts/sync-subscription.sh  # форсированный sync прямо сейчас
+./scripts/test-proxy.sh         # smoke test выхода через прокси
+./scripts/validate-config.sh    # полная проверка конфигурации
+./scripts/check-portability.sh  # проверка на user-specific absolute paths
 ```
 
-## Optional: autostart via systemd
+## Подключение клиентов
+
+Настрой клиентские устройства на:
+
+- HTTP proxy: `http://<server-ip>:<PROXY_PORT>`
+- SOCKS5 proxy: `<server-ip>:<PROXY_PORT>`
+- auth: `PROXY_AUTH`
+
+## Systemd автозапуск
+
+Используй установщик, который сам подставит актуальный путь проекта:
 
 ```bash
-sudo cp systemd/mihomo-gateway.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now mihomo-gateway.service
+./scripts/install-systemd.sh
 ```
 
-## Notes
+Скрипт:
 
-- `runtime/config.yaml` is generated from `config/mihomo.template.yaml`.
-- Sanitized provider is stored at `runtime/proxy_providers/main-subscription.yaml`.
-- Ranked provider is stored at `runtime/proxy_providers/main-subscription-ranked.yaml`.
-- Subscription refresh is controlled by `SANITIZE_INTERVAL`.
-- If several sources are configured, sync is best-effort:
-  failed sources are skipped, successful ones are merged.
-- Throughput ranking runs after a successful sync (if enabled).
-- Health checks and switching behavior are tuned by:
-  `HEALTHCHECK_INTERVAL`, `HEALTHCHECK_TIMEOUT`,
-  `URL_TEST_INTERVAL`, `URL_TEST_TOLERANCE`, `FALLBACK_INTERVAL`.
-- If sync fails, previous provider is kept; if no valid provider exists, status is `degraded_direct`.
+1. генерирует `/etc/systemd/system/mihomo-gateway.service` из `systemd/mihomo-gateway.service.template`
+2. выполняет `systemctl daemon-reload`
+3. включает и запускает `mihomo-gateway.service`
+
+Проверка:
+
+```bash
+systemctl status mihomo-gateway.service
+journalctl -u mihomo-gateway.service -n 100 --no-pager
+```
+
+## Где лежат артефакты runtime
+
+- `runtime/config.yaml` — сгенерированный рабочий конфиг Mihomo
+- `runtime/proxy_providers/main-subscription.yaml` — валидированный список после sync/sanitize
+- `runtime/proxy_providers/main-subscription-ranked.yaml` — список после ранжирования throughput
+- `runtime/status.json` — последний статус sync/валидации/ranking
+
+## Troubleshooting
+
+- `reason=all_sources_failed`: источники не скачались, проверь URL/доступ к GitHub.
+- `reason=validation_failed_or_not_enough_proxies`: после санитизации не осталось валидного минимума.
+- `throughput_reason=api_unreachable`: Mihomo controller недоступен на `API_BIND`.
+- `throughput_reason=tools_missing`: в sync-окружении нет `curl/jq`.
+- `status=degraded_direct`: актуальный валидный provider недоступен, используется safe-degraded режим.
+
+## Архитектура
+
+Подробный поток данных и логика переключений описаны в `docs/ARCHITECTURE.md`.
