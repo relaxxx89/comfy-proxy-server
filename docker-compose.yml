@@ -1,0 +1,27 @@
+services:
+  mihomo:
+    image: docker.io/metacubex/mihomo:latest
+    container_name: mihomo-gateway
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./runtime:/root/.config/mihomo
+    command:
+      - -d
+      - /root/.config/mihomo
+
+  subscription-sync:
+    image: docker.io/docker:cli
+    container_name: mihomo-subscription-sync
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    network_mode: host
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+    command:
+      - /bin/sh
+      - -c
+      - apk add --no-cache curl jq >/dev/null 2>&1 || true; ./scripts/subscription-worker.sh

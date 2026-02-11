@@ -1,0 +1,17 @@
+[Unit]
+Description=Mihomo LAN Proxy Gateway
+After=network-online.target docker.service
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/stepan/Documents/proxy-server
+ExecStart=/home/stepan/Documents/proxy-server/scripts/up.sh
+ExecStop=/home/stepan/Documents/proxy-server/scripts/down.sh
+TimeoutStartSec=120
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,71 @@
+mixed-port: __PROXY_PORT__
+allow-lan: true
+bind-address: "__LAN_BIND_IP__"
+mode: rule
+log-level: "__MIHOMO_LOG_LEVEL__"
+unified-delay: true
+
+authentication:
+  - "__PROXY_AUTH__"
+
+external-controller: "__API_BIND__"
+secret: "__API_SECRET__"
+
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: redir-host
+  nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+
+proxy-providers:
+  main-subscription:
+    type: file
+    path: ./proxy_providers/main-subscription.yaml
+    health-check:
+      enable: true
+      url: "__HEALTHCHECK_URL__"
+      interval: __HEALTHCHECK_INTERVAL__
+      timeout: __HEALTHCHECK_TIMEOUT__
+
+  main-subscription-ranked:
+    type: file
+    path: ./proxy_providers/main-subscription-ranked.yaml
+    health-check:
+      enable: true
+      url: "__HEALTHCHECK_URL__"
+      interval: __HEALTHCHECK_INTERVAL__
+      timeout: __HEALTHCHECK_TIMEOUT__
+
+proxy-groups:
+  - name: AUTO_SPEED
+    type: url-test
+    use:
+      - main-subscription-ranked
+    url: "__HEALTHCHECK_URL__"
+    interval: __URL_TEST_INTERVAL__
+    tolerance: __URL_TEST_TOLERANCE__
+
+  - name: AUTO_FAILSAFE
+    type: fallback
+    use:
+      - main-subscription-ranked
+    url: "__HEALTHCHECK_URL__"
+    interval: __FALLBACK_INTERVAL__
+
+  - name: BENCH
+    type: select
+    use:
+      - main-subscription-ranked
+
+  - name: PROXY
+    type: select
+    proxies:
+      - AUTO_SPEED
+      - AUTO_FAILSAFE
+      - BENCH
+      - DIRECT
+
+rules:
+  - MATCH,PROXY
