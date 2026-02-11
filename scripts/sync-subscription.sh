@@ -390,25 +390,14 @@ acquire_lock() {
     return 1
   fi
 
+  # Do not auto-recover lock here: PID namespaces and short races between
+  # mkdir/pid-write can make a live lock look stale and cause parallel syncs.
   if [ -n "${lock_pid}" ]; then
-    log "Stale sync lock detected (pid=${lock_pid}), recovering lock."
+    log "Sync lock exists with non-running pid=${lock_pid}; skipping to avoid parallel sync. Remove ${LOCK_DIR} manually if needed."
   else
-    log "Stale sync lock detected, recovering lock."
+    log "Sync lock exists without a valid pid; skipping to avoid parallel sync. Remove ${LOCK_DIR} manually if needed."
   fi
-
-  if ! rm -rf "${LOCK_DIR}" 2>/dev/null; then
-    log "Failed to remove stale lock at ${LOCK_DIR}; skipping this cycle."
-    return 1
-  fi
-
-  if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
-    log "Another sync acquired lock while recovering; skipping this cycle."
-    return 1
-  fi
-
-  printf '%s\n' "$$" > "${LOCK_PID_FILE}" 2>/dev/null || true
-  LOCK_OWNED=1
-  return 0
+  return 1
 }
 
 if ! acquire_lock; then
