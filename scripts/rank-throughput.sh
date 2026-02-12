@@ -289,17 +289,40 @@ bench_selector_ready_once() {
 wait_for_bench_selector_ready() {
   timeout_sec="$1"
   interval_sec="$2"
-  deadline=$((SECONDS + timeout_sec))
+  case "${timeout_sec}" in
+    ''|*[!0-9]*)
+      timeout_sec=1
+      ;;
+  esac
+  if [ "${timeout_sec}" -le 0 ]; then
+    timeout_sec=1
+  fi
 
-  while :; do
+  case "${interval_sec}" in
+    ''|*[!0-9]*)
+      interval_sec=1
+      ;;
+  esac
+  if [ "${interval_sec}" -le 0 ]; then
+    interval_sec=1
+  fi
+
+  max_attempts=$((timeout_sec / interval_sec))
+  if [ "${max_attempts}" -le 0 ]; then
+    max_attempts=1
+  fi
+  attempt=1
+
+  while [ "${attempt}" -le "${max_attempts}" ]; do
     if bench_selector_ready_once; then
       return 0
     fi
-    if [ "${SECONDS}" -ge "${deadline}" ]; then
-      return 1
+    if [ "${attempt}" -lt "${max_attempts}" ]; then
+      sleep "${interval_sec}"
     fi
-    sleep "${interval_sec}"
+    attempt=$((attempt + 1))
   done
+  return 1
 }
 
 switch_proxy_to_bench_with_retry() {

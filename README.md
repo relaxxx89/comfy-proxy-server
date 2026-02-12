@@ -155,6 +155,8 @@ journalctl -u mihomo-gateway.service -n 100 --no-pager
 - `throughput_reason=tools_missing`: в sync-окружении нет `curl/jq`.
 - `throughput_reason=bench_runtime_unavailable`: не удалось поднять изолированный bench-runtime (docker/порт/контейнер).
 - `throughput_reason=bench_unavailable`: (обычно при `THROUGHPUT_ISOLATED=false`) в текущем runtime-конфиге группа `PROXY` не содержит `BENCH`; перерендери конфиг (`./scripts/validate-config.sh` или `./scripts/up.sh`).
+- `throughput_reason=rank_exec_failed`: скрипт ранжирования завершился с ошибкой (деталь в логе `[subscription-sync] Throughput ranking script failed ...`).
+- `throughput_reason=rank_output_empty`: скрипт ранжирования завершился без метрик/результата; используется fallback на исходный provider.
 - `status=degraded_direct`: актуальный валидный provider недоступен, используется safe-degraded режим.
 - Если initial sync падает при старте, используй `./scripts/up.sh --allow-degraded-start` (временный fallback-режим).
 - Для удаления stale временных директорий выполни `./scripts/cleanup-runtime.sh`.

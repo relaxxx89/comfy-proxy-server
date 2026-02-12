@@ -433,9 +433,32 @@ run_throughput_ranking() {
     return 0
   fi
 
-  rank_output="$("${rank_script}" "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true)"
+  rank_stderr_file="${TMP_DIR}/rank-throughput.stderr"
+  : > "${rank_stderr_file}"
+
+  set +e
+  rank_output="$("${rank_script}" "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>"${rank_stderr_file}")"
+  rank_rc=$?
+  set -e
+
+  if [ "${rank_rc}" -ne 0 ]; then
+    throughput_reason="rank_exec_failed"
+    replace_file_from_source "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
+    rank_err_summary="$(tr '\n' ' ' < "${rank_stderr_file}" | sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | cut -c1-400)"
+    if [ -n "${rank_err_summary}" ]; then
+      log "Throughput ranking script failed (rc=${rank_rc}): ${rank_err_summary}"
+    else
+      log "Throughput ranking script failed (rc=${rank_rc}) without stderr output."
+    fi
+    return 0
+  fi
+
   if [ -z "${rank_output}" ]; then
     throughput_reason="rank_output_empty"
+    rank_err_summary="$(tr '\n' ' ' < "${rank_stderr_file}" | sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | cut -c1-400)"
+    if [ -n "${rank_err_summary}" ]; then
+      log "Throughput ranking output is empty (rc=0): ${rank_err_summary}"
+    fi
     replace_file_from_source "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
     return 0
   fi
