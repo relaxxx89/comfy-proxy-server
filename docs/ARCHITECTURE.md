@@ -10,6 +10,13 @@
 
 ## Поток данных
 
+0. `scripts/up.sh`
+   - рендерит runtime-конфиг
+   - поднимает `mihomo` + `docker-socket-proxy`
+   - ждёт доступности controller API
+   - выполняет initial one-shot sync/ranking в отдельном `subscription-sync` run
+   - запускает постоянный `subscription-worker` контейнер
+
 1. `scripts/render-config.sh`
    - читает `.env`
    - рендерит `config/mihomo.template.yaml` -> `runtime/config.yaml`

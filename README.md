@@ -95,8 +95,8 @@ cp .env.example .env
 ## Команды эксплуатации
 
 ```bash
-./scripts/up.sh                 # рендер + sync + сборка/запуск контейнеров
-./scripts/up.sh --allow-degraded-start  # запуск даже при ошибке initial sync
+./scripts/up.sh                 # рендер + запуск mihomo/socket-proxy + initial sync/ranking + запуск worker
+./scripts/up.sh --allow-degraded-start  # запуск даже при ошибке initial sync/ranking
 ./scripts/down.sh               # остановка контейнеров
 ./scripts/logs.sh               # логи mihomo и sync worker
 ./scripts/status.sh             # краткий статус последнего sync
