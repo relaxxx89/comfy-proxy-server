@@ -84,10 +84,16 @@ THROUGHPUT_TIMEOUT_SEC="${THROUGHPUT_TIMEOUT_SEC:-12}"
 THROUGHPUT_MIN_KBPS="${THROUGHPUT_MIN_KBPS:-50}"
 THROUGHPUT_SAMPLES="${THROUGHPUT_SAMPLES:-3}"
 THROUGHPUT_REQUIRED_SUCCESSES="${THROUGHPUT_REQUIRED_SUCCESSES:-0}"
+THROUGHPUT_ISOLATED="${THROUGHPUT_ISOLATED:-true}"
+THROUGHPUT_BENCH_PROXY_PORT="${THROUGHPUT_BENCH_PROXY_PORT:-17890}"
+THROUGHPUT_BENCH_API_PORT="${THROUGHPUT_BENCH_API_PORT:-19090}"
+THROUGHPUT_BENCH_DOCKER_TIMEOUT_SEC="${THROUGHPUT_BENCH_DOCKER_TIMEOUT_SEC:-20}"
+THROUGHPUT_BENCH_API_SECRET="${THROUGHPUT_BENCH_API_SECRET:-bench-secret-$$}"
 PROXY_PORT="${PROXY_PORT:-7890}"
 PROXY_AUTH="${PROXY_AUTH:-}"
 API_BIND="${API_BIND:-127.0.0.1:9090}"
 API_SECRET="${API_SECRET:-}"
+MIHOMO_IMAGE="${MIHOMO_IMAGE:-docker.io/metacubex/mihomo:latest}"
 
 case "${THROUGHPUT_ENABLE}" in
   true|TRUE|1|yes|YES)
@@ -156,21 +162,57 @@ if [ "${THROUGHPUT_REQUIRED_SUCCESSES}" -le 0 ] || [ "${THROUGHPUT_REQUIRED_SUCC
   THROUGHPUT_REQUIRED_SUCCESSES=$((THROUGHPUT_SAMPLES / 2 + 1))
 fi
 
+case "${THROUGHPUT_ISOLATED}" in
+  true|TRUE|1|yes|YES)
+    THROUGHPUT_ISOLATED=true
+    ;;
+  *)
+    THROUGHPUT_ISOLATED=false
+    ;;
+esac
+
+case "${THROUGHPUT_BENCH_PROXY_PORT}" in
+  ''|*[!0-9]*)
+    THROUGHPUT_BENCH_PROXY_PORT=17890
+    ;;
+esac
+if [ "${THROUGHPUT_BENCH_PROXY_PORT}" -le 0 ]; then
+  THROUGHPUT_BENCH_PROXY_PORT=17890
+fi
+
+case "${THROUGHPUT_BENCH_API_PORT}" in
+  ''|*[!0-9]*)
+    THROUGHPUT_BENCH_API_PORT=19090
+    ;;
+esac
+if [ "${THROUGHPUT_BENCH_API_PORT}" -le 0 ]; then
+  THROUGHPUT_BENCH_API_PORT=19090
+fi
+
+case "${THROUGHPUT_BENCH_DOCKER_TIMEOUT_SEC}" in
+  ''|*[!0-9]*)
+    THROUGHPUT_BENCH_DOCKER_TIMEOUT_SEC=20
+    ;;
+esac
+if [ "${THROUGHPUT_BENCH_DOCKER_TIMEOUT_SEC}" -le 0 ]; then
+  THROUGHPUT_BENCH_DOCKER_TIMEOUT_SEC=20
+fi
+
 MIN_BPS=$((THROUGHPUT_MIN_KBPS * 1024))
 TMP_DIR="$(mktemp -d "/tmp/mihomo-rank.XXXXXX" 2>/dev/null || mktemp -d "${ROOT_DIR}/runtime/rank.XXXXXX")"
 PROXY_STATE_FILE="${TMP_DIR}/proxy-state.json"
 PROXY_ALL_FILE="${TMP_DIR}/proxy-all.txt"
 CANDIDATE_SPEEDS_FILE="${TMP_DIR}/candidate-speeds.txt"
+BENCH_CONFIG_FILE="${TMP_DIR}/bench-config.yaml"
+BENCH_PROVIDER_FILE="${TMP_DIR}/candidate.txt"
 current_proxy="AUTO_FAILSAFE"
 restore_target="AUTO_FAILSAFE"
 proxy_switched_to_bench=0
 cleanup_done=0
+bench_container_name=""
 
-api_base="http://${API_BIND}"
+api_base=""
 auth_header=""
-if [ -n "${API_SECRET}" ]; then
-  auth_header="Authorization: Bearer ${API_SECRET}"
-fi
 
 api_call() {
   method="$1"
@@ -207,6 +249,155 @@ api_call() {
         "${api_base}${endpoint}"
     fi
   fi
+}
+
+setup_api_context() {
+  api_base="$1"
+  api_secret="$2"
+  if [ -n "${api_secret}" ]; then
+    auth_header="Authorization: Bearer ${api_secret}"
+  else
+    auth_header=""
+  fi
+}
+
+run_with_timeout() {
+  timeout_sec="$1"
+  shift
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${timeout_sec}" "$@"
+    return $?
+  fi
+
+  "$@" &
+  command_pid=$!
+
+  (
+    sleep "${timeout_sec}"
+    kill -TERM "${command_pid}" >/dev/null 2>&1 || exit 0
+    sleep 2
+    kill -KILL "${command_pid}" >/dev/null 2>&1 || exit 0
+  ) &
+  watchdog_pid=$!
+
+  if wait "${command_pid}"; then
+    command_rc=0
+  else
+    command_rc=$?
+  fi
+
+  kill "${watchdog_pid}" >/dev/null 2>&1 || true
+  wait "${watchdog_pid}" >/dev/null 2>&1 || true
+
+  case "${command_rc}" in
+    137|143)
+      return 124
+      ;;
+  esac
+
+  return "${command_rc}"
+}
+
+run_bench_docker() {
+  run_with_timeout "${THROUGHPUT_BENCH_DOCKER_TIMEOUT_SEC}" "$@"
+}
+
+cleanup_isolated_runtime() {
+  if [ -z "${bench_container_name}" ]; then
+    return 0
+  fi
+  run_bench_docker docker rm -fv "${bench_container_name}" >/dev/null 2>&1 || true
+  bench_container_name=""
+}
+
+start_isolated_runtime() {
+  if ! command -v docker >/dev/null 2>&1; then
+    throughput_reason="bench_runtime_unavailable"
+    return 1
+  fi
+
+  cp "${INPUT_FILE}" "${BENCH_PROVIDER_FILE}" || {
+    throughput_reason="bench_runtime_unavailable"
+    return 1
+  }
+
+  cat > "${BENCH_CONFIG_FILE}" <<EOF
+mixed-port: ${THROUGHPUT_BENCH_PROXY_PORT}
+allow-lan: false
+mode: rule
+log-level: error
+external-controller: 127.0.0.1:${THROUGHPUT_BENCH_API_PORT}
+secret: "${THROUGHPUT_BENCH_API_SECRET}"
+proxy-providers:
+  test:
+    type: file
+    path: ./candidate.txt
+proxy-groups:
+  - name: AUTO_FAILSAFE
+    type: fallback
+    use:
+      - test
+    url: https://www.gstatic.com/generate_204
+    interval: 600
+  - name: BENCH
+    type: select
+    use:
+      - test
+  - name: PROXY
+    type: select
+    proxies:
+      - AUTO_FAILSAFE
+      - BENCH
+      - DIRECT
+rules:
+  - MATCH,PROXY
+EOF
+
+  bench_container_name="mihomo-throughput-$$-$(date +%s)"
+  if ! run_bench_docker docker create --name "${bench_container_name}" \
+    --network host \
+    "${MIHOMO_IMAGE}" \
+    -d /root/.config/mihomo \
+    -f /root/.config/mihomo/bench-config.yaml >/dev/null; then
+    throughput_reason="bench_runtime_unavailable"
+    cleanup_isolated_runtime
+    return 1
+  fi
+
+  if ! run_bench_docker docker cp "${BENCH_PROVIDER_FILE}" "${bench_container_name}:/root/.config/mihomo/candidate.txt" >/dev/null; then
+    throughput_reason="bench_runtime_unavailable"
+    cleanup_isolated_runtime
+    return 1
+  fi
+
+  if ! run_bench_docker docker cp "${BENCH_CONFIG_FILE}" "${bench_container_name}:/root/.config/mihomo/bench-config.yaml" >/dev/null; then
+    throughput_reason="bench_runtime_unavailable"
+    cleanup_isolated_runtime
+    return 1
+  fi
+
+  if ! run_bench_docker docker start "${bench_container_name}" >/dev/null; then
+    throughput_reason="bench_runtime_unavailable"
+    cleanup_isolated_runtime
+    return 1
+  fi
+  setup_api_context "http://127.0.0.1:${THROUGHPUT_BENCH_API_PORT}" "${THROUGHPUT_BENCH_API_SECRET}"
+
+  api_wait_attempt=1
+  while [ "${api_wait_attempt}" -le 20 ]; do
+    if api_call GET "/version" >/dev/null 2>&1; then
+      PROXY_PORT="${THROUGHPUT_BENCH_PROXY_PORT}"
+      PROXY_AUTH=""
+      return 0
+    fi
+    sleep 1
+    api_wait_attempt=$((api_wait_attempt + 1))
+  done
+
+  throughput_reason="bench_runtime_unavailable"
+  cleanup_isolated_runtime
+  return 1
 }
 
 sanitize_restore_target() {
@@ -248,6 +439,7 @@ cleanup_rank() {
   fi
   cleanup_done=1
   restore_proxy_group
+  cleanup_isolated_runtime
   rm -rf "${TMP_DIR}"
 }
 
@@ -258,6 +450,8 @@ on_signal() {
 
 trap cleanup_rank EXIT
 trap on_signal INT TERM
+
+setup_api_context "http://${API_BIND}" "${API_SECRET}"
 
 if ! api_call GET "/version" > /dev/null 2>&1; then
   throughput_reason="api_unreachable"
@@ -289,6 +483,13 @@ if [ ! -s "${CANDIDATES_FILE}" ]; then
   throughput_reason="no_candidates"
   print_metrics
   exit 0
+fi
+
+if [ "${THROUGHPUT_ISOLATED}" = "true" ]; then
+  if ! start_isolated_runtime; then
+    print_metrics
+    exit 0
+  fi
 fi
 
 CURRENT_PROXY_FILE="${TMP_DIR}/current_proxy.txt"

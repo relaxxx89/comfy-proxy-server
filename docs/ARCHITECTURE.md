@@ -28,14 +28,14 @@
 
 3. `scripts/rank-throughput.sh`
    - берет кандидатов по ping history (`TOP_N`)
-   - перед тестом санитизирует цель восстановления (`BENCH`/`DIRECT` запрещены как final target)
-   - переключает `PROXY` на `BENCH` только на время измерений
+   - по умолчанию поднимает изолированный временный Mihomo runtime для speed-тестов (`THROUGHPUT_ISOLATED=true`)
+   - в изолированном runtime переключает `PROXY` на `BENCH` только на время измерений (не затрагивает боевой трафик)
    - меряет `speed_download` через локальный proxy port в несколько проходов (`THROUGHPUT_SAMPLES`)
    - считает медиану успешных замеров и требует минимум `THROUGHPUT_REQUIRED_SUCCESSES`
-   - всегда восстанавливает `PROXY` при любом завершении (EXIT/INT/TERM), с fallback в `AUTO_FAILSAFE`
+   - всегда выполняет cleanup на EXIT/INT/TERM (включая удаление временного bench-container)
    - сортирует по throughput и перестраивает порядок в
      `runtime/proxy_providers/main-subscription-ranked.yaml`
-   - если `PROXY` оказался в `BENCH`, sync делает auto-heal в `AUTO_FAILSAFE`
+   - если `THROUGHPUT_ISOLATED=false`, работает в legacy-режиме через боевой runtime (возможны кратковременные переключения `PROXY`)
 
 4. `scripts/subscription-worker.sh`
    - запускает sync в цикле с интервалом `SANITIZE_INTERVAL`

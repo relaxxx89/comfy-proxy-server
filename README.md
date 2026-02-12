@@ -81,12 +81,16 @@ cp .env.example .env
 | `SANITIZE_DROP_ANONYMOUS_FLAGGED` | нет | `true` | отбрасывать узлы с `🏳` и пустыми суффиксами (`vless-`, `ss-`, ...) |
 | `SANITIZE_REQUIRE_TLS_HOST` | нет | `true` | требовать валидный host для `vless/vmess/trojan` |
 | `THROUGHPUT_ENABLE` | нет | `true` | включить throughput ranking |
+| `THROUGHPUT_ISOLATED` | нет | `true` | запускать speed-тесты в изолированном временном Mihomo runtime (без переключения боевого `PROXY`) |
 | `THROUGHPUT_TOP_N` | нет | `10` | сколько ping-best прокси тестировать по скорости |
 | `THROUGHPUT_TEST_URL` | нет | `https://speed.cloudflare.com/__down?bytes=20000000` | URL для speed test |
 | `THROUGHPUT_TIMEOUT_SEC` | нет | `18` | timeout speed test на прокси |
 | `THROUGHPUT_MIN_KBPS` | нет | `2200` | минимум скорости для попадания в ranked |
 | `THROUGHPUT_SAMPLES` | нет | `5` | сколько speed-замеров делать на один прокси |
 | `THROUGHPUT_REQUIRED_SUCCESSES` | нет | `4` | минимум успешных замеров (>= `THROUGHPUT_MIN_KBPS`) для включения прокси в ranked |
+| `THROUGHPUT_BENCH_PROXY_PORT` | нет | `17890` | mixed-port изолированного bench-runtime для speed-тестов |
+| `THROUGHPUT_BENCH_API_PORT` | нет | `19090` | controller API порт изолированного bench-runtime |
+| `THROUGHPUT_BENCH_DOCKER_TIMEOUT_SEC` | нет | `20` | timeout docker-операций bench-runtime |
 
 ## Команды эксплуатации
 
@@ -149,7 +153,8 @@ journalctl -u mihomo-gateway.service -n 100 --no-pager
 - `reason=no_quality_proxies`: quality filter отфильтровал все узлы, проверь `SANITIZE_EXCLUDE_HOST_PATTERNS` и качество источника.
 - `throughput_reason=api_unreachable`: Mihomo controller недоступен на `API_BIND`.
 - `throughput_reason=tools_missing`: в sync-окружении нет `curl/jq`.
-- `throughput_reason=bench_unavailable`: в текущем runtime-конфиге группа `PROXY` не содержит `BENCH`; перерендери конфиг (`./scripts/validate-config.sh` или `./scripts/up.sh`).
+- `throughput_reason=bench_runtime_unavailable`: не удалось поднять изолированный bench-runtime (docker/порт/контейнер).
+- `throughput_reason=bench_unavailable`: (обычно при `THROUGHPUT_ISOLATED=false`) в текущем runtime-конфиге группа `PROXY` не содержит `BENCH`; перерендери конфиг (`./scripts/validate-config.sh` или `./scripts/up.sh`).
 - `status=degraded_direct`: актуальный валидный provider недоступен, используется safe-degraded режим.
 - Если initial sync падает при старте, используй `./scripts/up.sh --allow-degraded-start` (временный fallback-режим).
 - Для удаления stale временных директорий выполни `./scripts/cleanup-runtime.sh`.
