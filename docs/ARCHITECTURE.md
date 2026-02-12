@@ -4,8 +4,9 @@
 
 - `mihomo` (container): основной прокси-движок, слушает LAN-порт, держит proxy groups.
 - `subscription-sync` (container worker): периодически запускает `scripts/sync-subscription.sh`.
-- `scripts/*.sh` (host): orchestration, рендер конфига, валидация и ops-команды.
-- `runtime/*`: рабочие артефакты (config/provider/status).
+- `docker-socket-proxy` (container): ограниченный прокси-доступ к Docker API для worker.
+- `scripts/*.sh` (host + worker image): orchestration, рендер конфига, валидация и ops-команды.
+- `runtime/*`: рабочие артефакты (config/provider/status/metrics).
 
 ## Поток данных
 
@@ -23,6 +24,7 @@
    - сохраняет валидный provider в `runtime/proxy_providers/main-subscription.yaml`
    - запускает `scripts/rank-throughput.sh` (если включено) и пишет ranked provider
    - обновляет `runtime/status.json`
+   - использует временные каталоги в `/tmp` (с fallback в `runtime/`)
 
 3. `scripts/rank-throughput.sh`
    - берет кандидатов по ping history (`TOP_N`)
@@ -34,6 +36,13 @@
    - сортирует по throughput и перестраивает порядок в
      `runtime/proxy_providers/main-subscription-ranked.yaml`
    - если `PROXY` оказался в `BENCH`, sync делает auto-heal в `AUTO_FAILSAFE`
+
+4. `scripts/subscription-worker.sh`
+   - запускает sync в цикле с интервалом `SANITIZE_INTERVAL`
+   - ведет счетчик `consecutive_failures`
+   - обновляет `runtime/metrics.json`
+   - периодически чистит stale runtime-временные директории через `scripts/cleanup-runtime.sh`
+   - на shutdown дает sync время (`WORKER_INTERRUPT_GRACE_SEC`) на graceful cleanup и удаляет stale `.sync.lock`, если владелец PID уже не жив
 
 ## Группы в Mihomo
 

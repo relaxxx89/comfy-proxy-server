@@ -53,6 +53,10 @@ cp .env.example .env
 |---|---|---|---|
 | `SUBSCRIPTION_URLS` | нет | `https://.../a.txt,https://.../b.txt` | CSV список источников (предпочтительно) |
 | `SUBSCRIPTION_URL` | да | `https://.../single.txt` | fallback-источник, если `SUBSCRIPTION_URLS` пуст |
+| `MIHOMO_IMAGE` | нет | `docker.io/metacubex/mihomo:latest` | образ Mihomo (рекомендуется pin по digest) |
+| `DOCKER_CLI_IMAGE` | нет | `docker.io/docker:27-cli` | базовый image для sync worker |
+| `DOCKER_SOCKET_PROXY_IMAGE` | нет | `docker.io/tecnativa/docker-socket-proxy:0.3.0` | image socket-proxy для ограниченного Docker API |
+| `SYNC_WORKER_IMAGE` | нет | `proxy-server/subscription-sync:local` | локальный тег собранного sync worker image |
 | `LAN_BIND_IP` | да | `0.0.0.0` | bind адрес прокси на хосте |
 | `PROXY_PORT` | да | `7890` | порт HTTP/SOCKS прокси |
 | `PROXY_AUTH` | да | `user:pass` | авторизация на прокси |
@@ -66,6 +70,7 @@ cp .env.example .env
 | `URL_TEST_TOLERANCE` | да | `50` | tolerance для `AUTO_SPEED` |
 | `FALLBACK_INTERVAL` | да | `90` | интервал `AUTO_FAILSAFE` |
 | `SANITIZE_INTERVAL` | нет | `300` | период sync worker (сек) |
+| `WORKER_INTERRUPT_GRACE_SEC` | нет | `15` | grace period (сек) перед принудительным завершением текущего sync при остановке worker |
 | `MIN_VALID_PROXIES` | нет | `1` | минимум валидных прокси для принятия листа |
 | `SANITIZE_ALLOW_PROTOCOLS` | нет | `vless,trojan,ss,vmess` | разрешённые протоколы |
 | `EXCLUDE_COUNTRIES` | нет | `RU,BY` | исключаемые страны (ISO2) |
@@ -76,23 +81,25 @@ cp .env.example .env
 | `SANITIZE_DROP_ANONYMOUS_FLAGGED` | нет | `true` | отбрасывать узлы с `🏳` и пустыми суффиксами (`vless-`, `ss-`, ...) |
 | `SANITIZE_REQUIRE_TLS_HOST` | нет | `true` | требовать валидный host для `vless/vmess/trojan` |
 | `THROUGHPUT_ENABLE` | нет | `true` | включить throughput ranking |
-| `THROUGHPUT_TOP_N` | нет | `50` | сколько ping-best прокси тестировать по скорости |
-| `THROUGHPUT_TEST_URL` | нет | `https://speed.cloudflare.com/__down?bytes=5000000` | URL для speed test |
-| `THROUGHPUT_TIMEOUT_SEC` | нет | `12` | timeout speed test на прокси |
-| `THROUGHPUT_MIN_KBPS` | нет | `50` | минимум скорости для попадания в ranked |
-| `THROUGHPUT_SAMPLES` | нет | `3` | сколько speed-замеров делать на один прокси |
-| `THROUGHPUT_REQUIRED_SUCCESSES` | нет | `2` | минимум успешных замеров (>= `THROUGHPUT_MIN_KBPS`) для включения прокси в ranked |
+| `THROUGHPUT_TOP_N` | нет | `10` | сколько ping-best прокси тестировать по скорости |
+| `THROUGHPUT_TEST_URL` | нет | `https://speed.cloudflare.com/__down?bytes=20000000` | URL для speed test |
+| `THROUGHPUT_TIMEOUT_SEC` | нет | `18` | timeout speed test на прокси |
+| `THROUGHPUT_MIN_KBPS` | нет | `2200` | минимум скорости для попадания в ranked |
+| `THROUGHPUT_SAMPLES` | нет | `5` | сколько speed-замеров делать на один прокси |
+| `THROUGHPUT_REQUIRED_SUCCESSES` | нет | `4` | минимум успешных замеров (>= `THROUGHPUT_MIN_KBPS`) для включения прокси в ranked |
 
 ## Команды эксплуатации
 
 ```bash
-./scripts/up.sh                 # рендер + sync + запуск контейнеров
+./scripts/up.sh                 # рендер + sync + сборка/запуск контейнеров
+./scripts/up.sh --allow-degraded-start  # запуск даже при ошибке initial sync
 ./scripts/down.sh               # остановка контейнеров
 ./scripts/logs.sh               # логи mihomo и sync worker
 ./scripts/status.sh             # краткий статус последнего sync
 ./scripts/sync-subscription.sh  # форсированный sync прямо сейчас
 ./scripts/test-proxy.sh         # smoke test выхода через прокси
 ./scripts/validate-config.sh    # полная проверка конфигурации
+./scripts/cleanup-runtime.sh    # очистка stale runtime/sync.* и runtime/rank.*
 ./scripts/check-portability.sh  # проверка на user-specific absolute paths
 ```
 
@@ -131,6 +138,7 @@ journalctl -u mihomo-gateway.service -n 100 --no-pager
 - `runtime/proxy_providers/main-subscription.yaml` — валидированный список после sync/sanitize
 - `runtime/proxy_providers/main-subscription-ranked.yaml` — список после ранжирования throughput
 - `runtime/status.json` — последний статус sync/валидации/ranking
+- `runtime/metrics.json` — метрики worker (`consecutive_failures`, последние успех/ошибка)
 
 ## Troubleshooting
 
@@ -143,6 +151,8 @@ journalctl -u mihomo-gateway.service -n 100 --no-pager
 - `throughput_reason=tools_missing`: в sync-окружении нет `curl/jq`.
 - `throughput_reason=bench_unavailable`: в текущем runtime-конфиге группа `PROXY` не содержит `BENCH`; перерендери конфиг (`./scripts/validate-config.sh` или `./scripts/up.sh`).
 - `status=degraded_direct`: актуальный валидный provider недоступен, используется safe-degraded режим.
+- Если initial sync падает при старте, используй `./scripts/up.sh --allow-degraded-start` (временный fallback-режим).
+- Для удаления stale временных директорий выполни `./scripts/cleanup-runtime.sh`.
 - `BENCH` — служебная группа для ranking; пользовательский трафик должен идти через `AUTO_FAILSAFE`/`AUTO_SPEED`.
 - Если в логах много `dial PROXY ... context deadline exceeded`, проверь текущую группу через controller API (обязательно без прокси-переменных):
 ```bash

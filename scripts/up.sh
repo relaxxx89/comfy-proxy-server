@@ -7,6 +7,17 @@ LOCK_PID_FILE="${LOCK_DIR}/pid"
 SYNC_PID=""
 INTERRUPTING=0
 INTERRUPT_GRACE_SEC=3
+ALLOW_DEGRADED_START=0
+
+if [[ "${1:-}" == "--allow-degraded-start" ]]; then
+  ALLOW_DEGRADED_START=1
+  shift
+fi
+
+if [[ "$#" -ne 0 ]]; then
+  echo "Usage: $0 [--allow-degraded-start]" >&2
+  exit 1
+fi
 
 cleanup_sync_lock_if_owned() {
   if [[ -z "${SYNC_PID}" ]]; then
@@ -72,7 +83,20 @@ trap 'on_interrupt TERM' TERM
 "${ROOT_DIR}/scripts/render-config.sh"
 "${ROOT_DIR}/scripts/sync-subscription.sh" &
 SYNC_PID=$!
-wait "${SYNC_PID}" || true
+set +e
+wait "${SYNC_PID}"
+SYNC_RC=$?
+set -e
 cleanup_sync_lock_if_owned
 SYNC_PID=""
-docker compose --env-file "${ROOT_DIR}/.env" -f "${ROOT_DIR}/docker-compose.yml" up -d
+
+if [[ "${SYNC_RC}" -ne 0 && "${ALLOW_DEGRADED_START}" -ne 1 ]]; then
+  echo "Initial subscription sync failed with exit code ${SYNC_RC}. Use --allow-degraded-start to continue anyway." >&2
+  exit "${SYNC_RC}"
+fi
+
+if [[ "${SYNC_RC}" -ne 0 ]]; then
+  echo "Initial subscription sync failed (exit ${SYNC_RC}); continuing due to --allow-degraded-start." >&2
+fi
+
+docker compose --env-file "${ROOT_DIR}/.env" -f "${ROOT_DIR}/docker-compose.yml" up -d --build

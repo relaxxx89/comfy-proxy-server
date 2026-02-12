@@ -10,6 +10,16 @@ INPUT_FILE="$1"
 OUTPUT_FILE="$2"
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 ENV_FILE="${ROOT_DIR}/.env"
+ENV_LIB="${ROOT_DIR}/scripts/lib/env.sh"
+OUTPUT_DIR="$(CDPATH= cd -- "$(dirname -- "${OUTPUT_FILE}")" && pwd 2>/dev/null || true)"
+owner_ref_path="${OUTPUT_DIR}"
+if [ -z "${owner_ref_path}" ] || [ ! -d "${owner_ref_path}" ]; then
+  owner_ref_path="${ROOT_DIR}/runtime"
+fi
+if [ ! -d "${owner_ref_path}" ]; then
+  owner_ref_path="${ROOT_DIR}"
+fi
+owner_uid_gid="$(stat -c '%u:%g' "${owner_ref_path}" 2>/dev/null || true)"
 
 throughput_tested=0
 throughput_ranked=0
@@ -25,7 +35,31 @@ print_metrics() {
   echo "THROUGHPUT_TIMESTAMP=${throughput_timestamp}"
 }
 
-cp "${INPUT_FILE}" "${OUTPUT_FILE}"
+fix_owner() {
+  target_file="$1"
+  if [ -z "${owner_uid_gid}" ]; then
+    return 0
+  fi
+  if [ ! -e "${target_file}" ]; then
+    return 0
+  fi
+  if ! command -v chown >/dev/null 2>&1; then
+    return 0
+  fi
+  chown "${owner_uid_gid}" "${target_file}" >/dev/null 2>&1 || true
+}
+
+replace_file_from_source() {
+  source_file="$1"
+  target_file="$2"
+  tmp_file="${target_file}.tmp.$$"
+  cp "${source_file}" "${tmp_file}" || return 1
+  mv "${tmp_file}" "${target_file}" || return 1
+  fix_owner "${target_file}"
+  return 0
+}
+
+replace_file_from_source "${INPUT_FILE}" "${OUTPUT_FILE}" 2>/dev/null || true
 
 if [ ! -f "${ENV_FILE}" ]; then
   throughput_reason="missing_env"
@@ -33,10 +67,15 @@ if [ ! -f "${ENV_FILE}" ]; then
   exit 0
 fi
 
-# shellcheck disable=SC1090
-set -a
-. "${ENV_FILE}"
-set +a
+if [ ! -f "${ENV_LIB}" ]; then
+  throughput_reason="missing_env_lib"
+  print_metrics
+  exit 0
+fi
+
+# shellcheck disable=SC1091
+. "${ENV_LIB}"
+load_env_file "${ENV_FILE}"
 
 THROUGHPUT_ENABLE="${THROUGHPUT_ENABLE:-true}"
 THROUGHPUT_TOP_N="${THROUGHPUT_TOP_N:-50}"
@@ -118,7 +157,7 @@ if [ "${THROUGHPUT_REQUIRED_SUCCESSES}" -le 0 ] || [ "${THROUGHPUT_REQUIRED_SUCC
 fi
 
 MIN_BPS=$((THROUGHPUT_MIN_KBPS * 1024))
-TMP_DIR="$(mktemp -d "${ROOT_DIR}/runtime/rank.XXXXXX")"
+TMP_DIR="$(mktemp -d "/tmp/mihomo-rank.XXXXXX" 2>/dev/null || mktemp -d "${ROOT_DIR}/runtime/rank.XXXXXX")"
 PROXY_STATE_FILE="${TMP_DIR}/proxy-state.json"
 PROXY_ALL_FILE="${TMP_DIR}/proxy-all.txt"
 CANDIDATE_SPEEDS_FILE="${TMP_DIR}/candidate-speeds.txt"
@@ -436,7 +475,7 @@ END {
 ' "${SORTED_NAMES_FILE}" "${INPUT_FILE}" > "${RANKED_TMP}"
 
 if [ -s "${RANKED_TMP}" ]; then
-  cp "${RANKED_TMP}" "${OUTPUT_FILE}"
+  replace_file_from_source "${RANKED_TMP}" "${OUTPUT_FILE}" 2>/dev/null || true
   throughput_reason="ok"
 else
   throughput_reason="rank_output_empty"

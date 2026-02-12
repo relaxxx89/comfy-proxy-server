@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="${ROOT_DIR}/.env"
+ENV_LIB="${ROOT_DIR}/scripts/lib/env.sh"
 LOCK_DIR="${ROOT_DIR}/runtime/.sync.lock"
 LOCK_PID_FILE="${LOCK_DIR}/pid"
 SYNC_PID=""
@@ -72,13 +74,36 @@ trap 'on_interrupt TERM' TERM
 "${ROOT_DIR}/scripts/render-config.sh"
 "${ROOT_DIR}/scripts/sync-subscription.sh" &
 SYNC_PID=$!
-wait "${SYNC_PID}" || true
+set +e
+wait "${SYNC_PID}"
+SYNC_RC=$?
+set -e
 cleanup_sync_lock_if_owned
 SYNC_PID=""
 
+if [[ "${SYNC_RC}" -ne 0 ]]; then
+  echo "Initial subscription sync failed with exit code ${SYNC_RC}." >&2
+  exit "${SYNC_RC}"
+fi
+
+if [[ ! -f "${ENV_LIB}" ]]; then
+  echo "Missing ${ENV_LIB}." >&2
+  exit 1
+fi
+
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "Missing ${ENV_FILE}. Copy .env.example to .env and fill required values." >&2
+  exit 1
+fi
+
+# shellcheck disable=SC1091
+. "${ENV_LIB}"
+load_env_file "${ENV_FILE}"
+MIHOMO_IMAGE="${MIHOMO_IMAGE:-docker.io/metacubex/mihomo:latest}"
+
 docker run --rm \
   -v "${ROOT_DIR}/runtime:/root/.config/mihomo" \
-  docker.io/metacubex/mihomo:latest \
+  "${MIHOMO_IMAGE}" \
   -d /root/.config/mihomo \
   -f /root/.config/mihomo/config.yaml \
   -t

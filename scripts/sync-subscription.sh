@@ -3,6 +3,7 @@ set -eu
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 ENV_FILE="${ROOT_DIR}/.env"
+ENV_LIB="${ROOT_DIR}/scripts/lib/env.sh"
 RUNTIME_DIR="${ROOT_DIR}/runtime"
 PROVIDER_DIR="${RUNTIME_DIR}/proxy_providers"
 PROVIDER_FILE="${PROVIDER_DIR}/main-subscription.yaml"
@@ -22,7 +23,12 @@ throughput_failed=0
 throughput_reason="not_run"
 throughput_timestamp=""
 validate_fail_reason="not_run"
-owner_uid_gid="$(stat -c '%u:%g' "${ROOT_DIR}" 2>/dev/null || true)"
+ACTIVE_VALIDATE_CONTAINER=""
+owner_ref_path="${RUNTIME_DIR}"
+if [ ! -d "${owner_ref_path}" ]; then
+  owner_ref_path="${ROOT_DIR}"
+fi
+owner_uid_gid="$(stat -c '%u:%g' "${owner_ref_path}" 2>/dev/null || true)"
 
 log() {
   printf '[subscription-sync] %s\n' "$*"
@@ -44,6 +50,17 @@ fix_owner() {
     return 0
   fi
   chown "${owner_uid_gid}" "${target_file}" >/dev/null 2>&1 || true
+}
+
+replace_file_from_source() {
+  source_file="$1"
+  target_file="$2"
+  tmp_file="${target_file}.tmp.$$"
+
+  cp "${source_file}" "${tmp_file}" || return 1
+  mv "${tmp_file}" "${target_file}" || return 1
+  fix_owner "${target_file}"
+  return 0
 }
 
 count_provider_lines() {
@@ -73,7 +90,8 @@ write_status() {
   throughput_reason_escaped="$(json_escape "${throughput_reason}")"
   throughput_timestamp_escaped="$(json_escape "${throughput_timestamp}")"
 
-  cat > "${STATUS_FILE}" <<EOF
+  status_tmp="${STATUS_FILE}.tmp.$$"
+  cat > "${status_tmp}" <<EOF
 {
   "last_fetch": "${timestamp}",
   "status": "${status}",
@@ -97,6 +115,7 @@ write_status() {
 }
 EOF
 
+  mv "${status_tmp}" "${STATUS_FILE}"
   fix_owner "${STATUS_FILE}"
 
   if [ "${SANITIZE_LOG_JSON}" = "true" ]; then
@@ -162,7 +181,49 @@ run_with_timeout() {
 
 cleanup_validate_container() {
   container_name="$1"
-  run_with_timeout "${SANITIZE_VALIDATE_TIMEOUT_SEC}" docker rm -f "${container_name}" >/dev/null 2>&1 || true
+  cleanup_output=""
+  if cleanup_output="$(run_with_timeout "${SANITIZE_VALIDATE_TIMEOUT_SEC}" docker rm -fv "${container_name}" 2>&1)"; then
+    if [ "${container_name}" = "${ACTIVE_VALIDATE_CONTAINER}" ]; then
+      ACTIVE_VALIDATE_CONTAINER=""
+    fi
+    return 0
+  fi
+
+  cleanup_rc="$?"
+  case "${cleanup_output}" in
+    *"No such container"*)
+      if [ "${container_name}" = "${ACTIVE_VALIDATE_CONTAINER}" ]; then
+        ACTIVE_VALIDATE_CONTAINER=""
+      fi
+      return 0
+      ;;
+  esac
+
+  cleanup_msg="$(printf '%s' "${cleanup_output}" | tr '\n' ' ' | sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  if [ -n "${cleanup_msg}" ]; then
+    log "Failed to cleanup validate container ${container_name} with volumes (rc=${cleanup_rc}): ${cleanup_msg}"
+  else
+    log "Failed to cleanup validate container ${container_name} with volumes (rc=${cleanup_rc})."
+  fi
+  if [ "${container_name}" = "${ACTIVE_VALIDATE_CONTAINER}" ]; then
+    ACTIVE_VALIDATE_CONTAINER=""
+  fi
+  return 0
+}
+
+cleanup_orphan_validate_containers() {
+  stale_ids="$(docker ps -aq --filter "name=mihomo-validate-" 2>/dev/null || true)"
+  if [ -z "${stale_ids}" ]; then
+    return 0
+  fi
+
+  stale_count=0
+  for stale_id in ${stale_ids}; do
+    run_with_timeout "${SANITIZE_VALIDATE_TIMEOUT_SEC}" docker rm -fv "${stale_id}" >/dev/null 2>&1 || true
+    stale_count=$((stale_count + 1))
+  done
+  log "Cleaned up ${stale_count} orphan validate container(s) before sync."
+  return 0
 }
 
 set_validate_fail_reason_by_rc() {
@@ -212,9 +273,10 @@ rules:
 EOF
 
   cleanup_validate_container "${validate_container}"
+  ACTIVE_VALIDATE_CONTAINER="${validate_container}"
 
   if ! run_validate_docker docker create --name "${validate_container}" \
-    docker.io/metacubex/mihomo:latest \
+    "${MIHOMO_IMAGE}" \
     -d /root/.config/mihomo \
     -f /root/.config/mihomo/validate-config.yaml >/dev/null; then
     cleanup_validate_container "${validate_container}"
@@ -269,14 +331,14 @@ run_throughput_ranking() {
   rank_script="${ROOT_DIR}/scripts/rank-throughput.sh"
   if [ ! -x "${rank_script}" ]; then
     throughput_reason="rank_script_missing"
-    cp "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
+    replace_file_from_source "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
     return 0
   fi
 
   rank_output="$("${rank_script}" "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true)"
   if [ -z "${rank_output}" ]; then
     throughput_reason="rank_output_empty"
-    cp "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
+    replace_file_from_source "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
     return 0
   fi
 
@@ -293,7 +355,7 @@ ${rank_output}
 EOF
 
   if [ ! -s "${RANKED_PROVIDER_FILE}" ]; then
-    cp "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
+    replace_file_from_source "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
     throughput_reason="rank_output_empty"
   fi
   fix_owner "${RANKED_PROVIDER_FILE}"
@@ -367,9 +429,16 @@ if [ ! -f "${ENV_FILE}" ]; then
   exit 1
 fi
 
+if [ ! -f "${ENV_LIB}" ]; then
+  echo "Missing ${ENV_LIB}." >&2
+  exit 1
+fi
+
 acquire_lock() {
-  if mkdir "${LOCK_DIR}" 2>/dev/null; then
+  if mkdir -m 0777 "${LOCK_DIR}" 2>/dev/null; then
+    fix_owner "${LOCK_DIR}"
     printf '%s\n' "$$" > "${LOCK_PID_FILE}" 2>/dev/null || true
+    fix_owner "${LOCK_PID_FILE}"
     LOCK_OWNED=1
     return 0
   fi
@@ -478,6 +547,10 @@ on_interrupt() {
   INTERRUPTING=1
   log "Received ${signal_name}; terminating child processes and releasing lock."
 
+  if [ -n "${ACTIVE_VALIDATE_CONTAINER}" ]; then
+    cleanup_validate_container "${ACTIVE_VALIDATE_CONTAINER}"
+  fi
+
   signal_children TERM
   if ! wait_children_exit "${INTERRUPT_GRACE_SEC}"; then
     signal_children KILL
@@ -491,10 +564,9 @@ trap cleanup_lock EXIT
 trap 'on_interrupt INT' INT
 trap 'on_interrupt TERM' TERM
 
-# shellcheck disable=SC1090
-set -a
-. "${ENV_FILE}"
-set +a
+# shellcheck disable=SC1091
+. "${ENV_LIB}"
+load_env_file "${ENV_FILE}"
 
 SUBSCRIPTION_URLS="${SUBSCRIPTION_URLS:-}"
 SUBSCRIPTION_URL="${SUBSCRIPTION_URL:-}"
@@ -508,6 +580,7 @@ SANITIZE_VALIDATE_MAX_ITERATIONS="${SANITIZE_VALIDATE_MAX_ITERATIONS:-80}"
 SANITIZE_EXCLUDE_HOST_PATTERNS="${SANITIZE_EXCLUDE_HOST_PATTERNS:-boot-lee.ru,openproxylist.com}"
 SANITIZE_DROP_ANONYMOUS_FLAGGED="${SANITIZE_DROP_ANONYMOUS_FLAGGED:-true}"
 SANITIZE_REQUIRE_TLS_HOST="${SANITIZE_REQUIRE_TLS_HOST:-true}"
+MIHOMO_IMAGE="${MIHOMO_IMAGE:-docker.io/metacubex/mihomo:latest}"
 
 case "${SANITIZE_VALIDATE_TIMEOUT_SEC}" in
   ''|*[!0-9]*)
@@ -517,6 +590,8 @@ esac
 if [ "${SANITIZE_VALIDATE_TIMEOUT_SEC}" -le 0 ]; then
   SANITIZE_VALIDATE_TIMEOUT_SEC=10
 fi
+
+cleanup_orphan_validate_containers
 
 case "${SANITIZE_VALIDATE_MAX_ITERATIONS}" in
   ''|*[!0-9]*)
@@ -552,12 +627,14 @@ if [ ! -f "${PROVIDER_FILE}" ]; then
   : > "${PROVIDER_FILE}"
 fi
 if [ ! -f "${RANKED_PROVIDER_FILE}" ]; then
-  cp "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || : > "${RANKED_PROVIDER_FILE}"
+  if ! replace_file_from_source "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null; then
+    : > "${RANKED_PROVIDER_FILE}"
+  fi
 fi
 fix_owner "${PROVIDER_FILE}"
 fix_owner "${RANKED_PROVIDER_FILE}"
 
-TMP_DIR="$(mktemp -d "${RUNTIME_DIR}/sync.XXXXXX")"
+TMP_DIR="$(mktemp -d "/tmp/mihomo-sync.XXXXXX" 2>/dev/null || mktemp -d "${RUNTIME_DIR}/sync.XXXXXX")"
 
 SOURCE_LIST_FILE="${TMP_DIR}/source-urls.txt"
 MERGED_URI_FILE="${TMP_DIR}/merged-uris.txt"
@@ -694,8 +771,7 @@ if [ -n "${single_yaml_mode}" ] && [ "${source_total}" -eq 1 ]; then
     cp "${SINGLE_YAML_FILE}" "${TMP_DIR}/provider.new"
     mv "${TMP_DIR}/provider.new" "${PROVIDER_FILE}"
     fix_owner "${PROVIDER_FILE}"
-    cp "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
-    fix_owner "${RANKED_PROVIDER_FILE}"
+    replace_file_from_source "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
     run_throughput_ranking
     ensure_proxy_not_bench
     write_status "healthy" "ok" "${raw_count}" "${filtered_count}" "${valid_count}" "${dropped_count}" "${single_yaml_mode}" "" "${source_urls_joined}" "${source_total}" "${source_ok}" "${source_failed}" "${excluded_by_country}"
@@ -1048,8 +1124,7 @@ if [ "${final_validation_ok}" -eq 1 ]; then
   cp "${WORKING_FILE}" "${TMP_DIR}/provider.new"
   mv "${TMP_DIR}/provider.new" "${PROVIDER_FILE}"
   fix_owner "${PROVIDER_FILE}"
-  cp "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
-  fix_owner "${RANKED_PROVIDER_FILE}"
+  replace_file_from_source "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
   run_throughput_ranking
   ensure_proxy_not_bench
   write_status "healthy" "ok" "${raw_count}" "${filtered_count}" "${valid_count}" "${dropped_count}" "${mode}" "" "${source_urls_joined}" "${source_total}" "${source_ok}" "${source_failed}" "${excluded_by_country}"

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ROOT_DIR}/.env"
+ENV_LIB="${ROOT_DIR}/scripts/lib/env.sh"
 TEMPLATE_FILE="${ROOT_DIR}/config/mihomo.template.yaml"
 RUNTIME_DIR="${ROOT_DIR}/runtime"
 OUTPUT_FILE="${RUNTIME_DIR}/config.yaml"
@@ -12,8 +13,14 @@ if [[ ! -f "${ENV_FILE}" ]]; then
   exit 1
 fi
 
-# shellcheck disable=SC1090
-source "${ENV_FILE}"
+if [[ ! -f "${ENV_LIB}" ]]; then
+  echo "Missing ${ENV_LIB}." >&2
+  exit 1
+fi
+
+# shellcheck disable=SC1091
+. "${ENV_LIB}"
+load_env_file "${ENV_FILE}"
 
 required_vars=(
   SUBSCRIPTION_URL
@@ -31,12 +38,7 @@ required_vars=(
   FALLBACK_INTERVAL
 )
 
-for var_name in "${required_vars[@]}"; do
-  if [[ -z "${!var_name:-}" ]]; then
-    echo "Required variable ${var_name} is empty in ${ENV_FILE}" >&2
-    exit 1
-  fi
-done
+require_env_vars "${required_vars[@]}" || exit 1
 
 mkdir -p "${RUNTIME_DIR}/proxy_providers"
 

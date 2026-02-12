@@ -1,0 +1,10 @@
+ARG DOCKER_CLI_IMAGE=docker.io/docker:27-cli
+FROM ${DOCKER_CLI_IMAGE}
+
+RUN apk add --no-cache bash curl jq coreutils
+
+WORKDIR /opt/app
+COPY scripts ./scripts
+COPY config ./config
+
+RUN chmod +x ./scripts/*.sh && mkdir -p ./runtime/proxy_providers
