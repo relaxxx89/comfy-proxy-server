@@ -26,6 +26,7 @@ throughput_ranked=0
 throughput_failed=0
 throughput_reason="disabled"
 throughput_timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+bench_selector_last_error=""
 
 print_metrics() {
   echo "THROUGHPUT_TESTED=${throughput_tested}"
@@ -33,6 +34,10 @@ print_metrics() {
   echo "THROUGHPUT_FAILED=${throughput_failed}"
   echo "THROUGHPUT_REASON=${throughput_reason}"
   echo "THROUGHPUT_TIMESTAMP=${throughput_timestamp}"
+}
+
+log() {
+  printf '[throughput-rank] %s\n' "$*" >&2
 }
 
 fix_owner() {
@@ -259,6 +264,67 @@ setup_api_context() {
   else
     auth_header=""
   fi
+}
+
+bench_selector_ready_once() {
+  if ! api_call GET "/proxies/PROXY" > "${PROXY_STATE_FILE}" 2>/dev/null; then
+    bench_selector_last_error="selector_unreachable"
+    return 1
+  fi
+
+  if ! jq -e '.all | type == "array"' "${PROXY_STATE_FILE}" >/dev/null 2>&1; then
+    bench_selector_last_error="selector_all_missing"
+    return 1
+  fi
+
+  if ! jq -e '.all[]? | select(. == "BENCH")' "${PROXY_STATE_FILE}" >/dev/null 2>&1; then
+    bench_selector_last_error="bench_missing"
+    return 1
+  fi
+
+  bench_selector_last_error=""
+  return 0
+}
+
+wait_for_bench_selector_ready() {
+  timeout_sec="$1"
+  interval_sec="$2"
+  deadline=$((SECONDS + timeout_sec))
+
+  while :; do
+    if bench_selector_ready_once; then
+      return 0
+    fi
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      return 1
+    fi
+    sleep "${interval_sec}"
+  done
+}
+
+switch_proxy_to_bench_with_retry() {
+  max_attempts="$1"
+  sleep_sec="$2"
+  attempt=1
+  proxy_switch_payload="$(jq -cn --arg name "BENCH" '{name:$name}')"
+
+  while [ "${attempt}" -le "${max_attempts}" ]; do
+    if bench_selector_ready_once; then
+      if api_call PUT "/proxies/PROXY" "${proxy_switch_payload}" > /dev/null 2>&1; then
+        proxy_switched_to_bench=1
+        bench_selector_last_error=""
+        return 0
+      fi
+      bench_selector_last_error="switch_failed"
+    fi
+
+    if [ "${attempt}" -lt "${max_attempts}" ]; then
+      sleep "${sleep_sec}"
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  return 1
 }
 
 run_with_timeout() {
@@ -511,13 +577,19 @@ if [ "${current_proxy}" = "BENCH" ]; then
   fi
 fi
 
-proxy_switch_payload="$(jq -cn --arg name "BENCH" '{name:$name}')"
-if ! api_call PUT "/proxies/PROXY" "${proxy_switch_payload}" > /dev/null 2>&1; then
+if ! wait_for_bench_selector_ready "${THROUGHPUT_BENCH_DOCKER_TIMEOUT_SEC}" 1; then
+  log "PROXY selector is not ready for BENCH (last_error=${bench_selector_last_error})"
   throughput_reason="bench_unavailable"
   print_metrics
   exit 0
 fi
-proxy_switched_to_bench=1
+
+if ! switch_proxy_to_bench_with_retry 8 1; then
+  log "Failed to switch PROXY to BENCH after retries (last_error=${bench_selector_last_error})"
+  throughput_reason="bench_unavailable"
+  print_metrics
+  exit 0
+fi
 
 SCORES_FILE="${TMP_DIR}/scores.tsv"
 : > "${SCORES_FILE}"
