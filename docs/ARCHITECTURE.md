@@ -42,7 +42,7 @@
    - ведет счетчик `consecutive_failures`
    - обновляет `runtime/metrics.json`
    - периодически чистит stale runtime-временные директории через `scripts/cleanup-runtime.sh`
-   - на shutdown дает sync время (`WORKER_INTERRUPT_GRACE_SEC`) на graceful cleanup и удаляет stale `.sync.lock`, если владелец PID уже не жив
+   - на shutdown дает sync время (`WORKER_INTERRUPT_GRACE_SEC`) на graceful cleanup
 
 ## Группы в Mihomo
 
@@ -56,7 +56,8 @@
 - Если новый sync невалиден, текущий рабочий provider не затирается.
 - При полном провале источников фиксируется `status=degraded_direct`.
 - Цикл удаления битых узлов ограничен `SANITIZE_VALIDATE_TIMEOUT_SEC` и `SANITIZE_VALIDATE_MAX_ITERATIONS` для предсказуемого времени завершения sync.
-- При `SIGINT`/`SIGTERM` sync и его обертки завершают дочерние процессы и освобождают lock по PID владельца.
+- Sync-сериализация выполняется через `flock` (`runtime/.sync.lock.flock`), метаданные владельца пишутся в `runtime/.sync.lock.meta`.
+- При `SIGINT`/`SIGTERM` sync и его обертки завершают дочерние процессы и освобождают lock.
 - Failover в рантайме обрабатывается `AUTO_FAILSAFE`.
 - Если `PROXY` по ошибке залипает в `BENCH`, post-rank guard возвращает `AUTO_FAILSAFE`.
 

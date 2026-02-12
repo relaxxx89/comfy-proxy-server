@@ -2,8 +2,6 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOCK_DIR="${ROOT_DIR}/runtime/.sync.lock"
-LOCK_PID_FILE="${LOCK_DIR}/pid"
 SYNC_PID=""
 INTERRUPTING=0
 INTERRUPT_GRACE_SEC=3
@@ -18,24 +16,6 @@ if [[ "$#" -ne 0 ]]; then
   echo "Usage: $0 [--allow-degraded-start]" >&2
   exit 1
 fi
-
-cleanup_sync_lock_if_owned() {
-  if [[ -z "${SYNC_PID}" ]]; then
-    return 0
-  fi
-
-  local lock_pid=""
-  if [[ -f "${LOCK_PID_FILE}" ]]; then
-    lock_pid="$(cat "${LOCK_PID_FILE}" 2>/dev/null || true)"
-  fi
-
-  if [[ -n "${lock_pid}" && "${lock_pid}" != "${SYNC_PID}" ]]; then
-    return 0
-  fi
-
-  rm -f "${LOCK_PID_FILE}" >/dev/null 2>&1 || true
-  rm -rf "${LOCK_DIR}" >/dev/null 2>&1 || true
-}
 
 stop_sync_process() {
   if [[ -z "${SYNC_PID}" ]]; then
@@ -58,7 +38,6 @@ stop_sync_process() {
   fi
 
   wait "${SYNC_PID}" >/dev/null 2>&1 || true
-  cleanup_sync_lock_if_owned
   SYNC_PID=""
 }
 
@@ -81,13 +60,12 @@ trap 'on_interrupt INT' INT
 trap 'on_interrupt TERM' TERM
 
 "${ROOT_DIR}/scripts/render-config.sh"
-"${ROOT_DIR}/scripts/sync-subscription.sh" &
+SYNC_INVOKER=up "${ROOT_DIR}/scripts/sync-subscription.sh" &
 SYNC_PID=$!
 set +e
 wait "${SYNC_PID}"
 SYNC_RC=$?
 set -e
-cleanup_sync_lock_if_owned
 SYNC_PID=""
 
 if [[ "${SYNC_RC}" -ne 0 && "${ALLOW_DEGRADED_START}" -ne 1 ]]; then

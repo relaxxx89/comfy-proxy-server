@@ -8,8 +8,6 @@ ENV_LIB="${ROOT_DIR}/scripts/lib/env.sh"
 CLEANUP_SCRIPT="${ROOT_DIR}/scripts/cleanup-runtime.sh"
 STATUS_FILE="${RUNTIME_DIR}/status.json"
 METRICS_FILE="${RUNTIME_DIR}/metrics.json"
-LOCK_DIR="${RUNTIME_DIR}/.sync.lock"
-LOCK_PID_FILE="${LOCK_DIR}/pid"
 sync_pid=""
 worker_stopping=0
 INTERRUPT_GRACE_SEC="${WORKER_INTERRUPT_GRACE_SEC:-15}"
@@ -143,30 +141,6 @@ EOF
   fix_owner "${METRICS_FILE}"
 }
 
-cleanup_stale_lock() {
-  if [ ! -d "${LOCK_DIR}" ]; then
-    return 0
-  fi
-
-  lock_pid=""
-  if [ -f "${LOCK_PID_FILE}" ]; then
-    lock_pid="$(cat "${LOCK_PID_FILE}" 2>/dev/null || true)"
-  fi
-
-  case "${lock_pid}" in
-    ''|*[!0-9]*)
-      lock_pid=""
-      ;;
-  esac
-
-  if [ -n "${lock_pid}" ] && kill -0 "${lock_pid}" >/dev/null 2>&1; then
-    return 0
-  fi
-
-  rm -f "${LOCK_PID_FILE}" >/dev/null 2>&1 || true
-  rm -rf "${LOCK_DIR}" >/dev/null 2>&1 || true
-}
-
 stop_current_sync() {
   if [ -z "${sync_pid}" ]; then
     return 0
@@ -189,7 +163,6 @@ stop_current_sync() {
 
   wait "${sync_pid}" >/dev/null 2>&1 || true
   sync_pid=""
-  cleanup_stale_lock
 }
 
 on_interrupt() {
@@ -204,7 +177,6 @@ on_interrupt() {
 
 cleanup_worker() {
   stop_current_sync
-  cleanup_stale_lock
 }
 
 trap cleanup_worker EXIT
@@ -212,18 +184,15 @@ trap 'on_interrupt INT' INT
 trap 'on_interrupt TERM' TERM
 
 owner_uid_gid="$(stat -c '%u:%g' "${RUNTIME_DIR}" 2>/dev/null || true)"
-cleanup_stale_lock
 
 write_metrics "starting" "worker_boot"
 
 while :; do
-  cleanup_stale_lock
-
   if [ -x "${CLEANUP_SCRIPT}" ]; then
     "${CLEANUP_SCRIPT}" --hours 24 --quiet >/dev/null 2>&1 || true
   fi
 
-  "${ROOT_DIR}/scripts/sync-subscription.sh" &
+  SYNC_INVOKER=worker "${ROOT_DIR}/scripts/sync-subscription.sh" &
   sync_pid=$!
   set +e
   wait "${sync_pid}"

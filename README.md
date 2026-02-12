@@ -173,8 +173,9 @@ env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u AL
   -d '{"name":"AUTO_FAILSAFE"}' \
   http://127.0.0.1:9090/proxies/PROXY
 ```
-- При `Ctrl+C` в `./scripts/validate-config.sh` или `./scripts/up.sh` sync-lock чистится автоматически.
-- Если lock был создан другим UID (например, root), очисти его тем же пользователем: `sudo rm -rf runtime/.sync.lock`.
+- Сериализация sync теперь через `flock`: lock-file `runtime/.sync.lock.flock`, метаданные владельца — `runtime/.sync.lock.meta`.
+- Если в логах есть `flock is unavailable; using legacy PID lock`, lock-каталог fallback: `runtime/.sync.lock`.
+- В `subscription-sync` используется BusyBox `ps`: для диагностики запускай `ps -o pid,ppid,etime,cmd` (без `-ax`).
 
 ## Архитектура
 

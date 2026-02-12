@@ -9,11 +9,16 @@ PROVIDER_DIR="${RUNTIME_DIR}/proxy_providers"
 PROVIDER_FILE="${PROVIDER_DIR}/main-subscription.yaml"
 RANKED_PROVIDER_FILE="${PROVIDER_DIR}/main-subscription-ranked.yaml"
 STATUS_FILE="${RUNTIME_DIR}/status.json"
-LOCK_DIR="${RUNTIME_DIR}/.sync.lock"
-LOCK_PID_FILE="${LOCK_DIR}/pid"
+LOCK_FILE="${RUNTIME_DIR}/.sync.lock.flock"
+LOCK_META_FILE="${RUNTIME_DIR}/.sync.lock.meta"
+LEGACY_LOCK_DIR="${RUNTIME_DIR}/.sync.lock"
+LEGACY_LOCK_PID_FILE="${LEGACY_LOCK_DIR}/pid"
 TMP_DIR=""
 LOCK_OWNED=0
 LOCK_CLEANED=0
+LOCK_MODE=""
+LOCK_FD_OPEN=0
+LOCK_INVOKER="manual"
 INTERRUPTING=0
 INTERRUPT_GRACE_SEC=3
 
@@ -50,6 +55,99 @@ fix_owner() {
     return 0
   fi
   chown "${owner_uid_gid}" "${target_file}" >/dev/null 2>&1 || true
+}
+
+detect_lock_invoker() {
+  if [ -n "${SYNC_INVOKER:-}" ]; then
+    printf '%s\n' "${SYNC_INVOKER}"
+    return 0
+  fi
+
+  parent_cmd=""
+  if [ -r "/proc/${PPID}/cmdline" ]; then
+    parent_cmd="$(tr '\000' ' ' < "/proc/${PPID}/cmdline" 2>/dev/null || true)"
+  fi
+
+  case "${parent_cmd}" in
+    *subscription-worker.sh*) printf 'worker\n' ;;
+    *validate-config.sh*) printf 'validate\n' ;;
+    *up.sh*) printf 'up\n' ;;
+    *) printf 'manual\n' ;;
+  esac
+}
+
+write_lock_metadata() {
+  lock_meta_tmp="${LOCK_META_FILE}.tmp.$$"
+  lock_meta_started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  lock_invoker_escaped="$(json_escape "${LOCK_INVOKER}")"
+  lock_mode_escaped="$(json_escape "${LOCK_MODE}")"
+
+  cat > "${lock_meta_tmp}" <<EOF
+{
+  "pid": $$,
+  "started_at": "${lock_meta_started_at}",
+  "invoker": "${lock_invoker_escaped}",
+  "mode": "${lock_mode_escaped}"
+}
+EOF
+  mv "${lock_meta_tmp}" "${LOCK_META_FILE}"
+  fix_owner "${LOCK_META_FILE}"
+}
+
+read_lock_metadata_owner() {
+  if [ ! -s "${LOCK_META_FILE}" ]; then
+    printf 'pid=unknown started_at=unknown invoker=unknown mode=unknown\n'
+    return 0
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    owner_line="$(jq -r '"pid=\(.pid // "unknown") started_at=\(.started_at // "unknown") invoker=\(.invoker // "unknown") mode=\(.mode // "unknown")"' "${LOCK_META_FILE}" 2>/dev/null || true)"
+    if [ -n "${owner_line}" ] && [ "${owner_line}" != "null" ]; then
+      printf '%s\n' "${owner_line}"
+      return 0
+    fi
+  fi
+
+  owner_pid="$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${LOCK_META_FILE}" 2>/dev/null | head -n 1)"
+  owner_started_at="$(sed -n 's/.*"started_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${LOCK_META_FILE}" 2>/dev/null | head -n 1)"
+  owner_invoker="$(sed -n 's/.*"invoker"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${LOCK_META_FILE}" 2>/dev/null | head -n 1)"
+  owner_mode="$(sed -n 's/.*"mode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${LOCK_META_FILE}" 2>/dev/null | head -n 1)"
+
+  [ -n "${owner_pid}" ] || owner_pid="unknown"
+  [ -n "${owner_started_at}" ] || owner_started_at="unknown"
+  [ -n "${owner_invoker}" ] || owner_invoker="unknown"
+  [ -n "${owner_mode}" ] || owner_mode="unknown"
+  printf 'pid=%s started_at=%s invoker=%s mode=%s\n' "${owner_pid}" "${owner_started_at}" "${owner_invoker}" "${owner_mode}"
+}
+
+read_lock_metadata_pid() {
+  if [ ! -s "${LOCK_META_FILE}" ]; then
+    printf '\n'
+    return 0
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    owner_pid="$(jq -r '.pid // ""' "${LOCK_META_FILE}" 2>/dev/null || true)"
+    if [ -n "${owner_pid}" ] && [ "${owner_pid}" != "null" ]; then
+      printf '%s\n' "${owner_pid}"
+      return 0
+    fi
+  fi
+
+  owner_pid="$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${LOCK_META_FILE}" 2>/dev/null | head -n 1)"
+  printf '%s\n' "${owner_pid}"
+}
+
+lock_metadata_owned_by_self() {
+  owner_pid="$(read_lock_metadata_pid)"
+  [ -n "${owner_pid}" ] && [ "${owner_pid}" = "$$" ]
+}
+
+close_lock_fd() {
+  if [ "${LOCK_FD_OPEN}" -eq 1 ]; then
+    exec 9>&-
+    LOCK_FD_OPEN=0
+  fi
 }
 
 replace_file_from_source() {
@@ -435,17 +533,57 @@ if [ ! -f "${ENV_LIB}" ]; then
 fi
 
 acquire_lock() {
-  if mkdir -m 0777 "${LOCK_DIR}" 2>/dev/null; then
-    fix_owner "${LOCK_DIR}"
-    printf '%s\n' "$$" > "${LOCK_PID_FILE}" 2>/dev/null || true
-    fix_owner "${LOCK_PID_FILE}"
+  mkdir -p "${RUNTIME_DIR}"
+
+  if command -v flock >/dev/null 2>&1; then
+    acquire_flock_lock
+    return $?
+  fi
+
+  log "flock is unavailable; using legacy PID lock."
+  acquire_legacy_lock
+}
+
+acquire_flock_lock() {
+  if ! : >> "${LOCK_FILE}" 2>/dev/null; then
+    log "Failed to create lock file ${LOCK_FILE}; skipping this cycle."
+    return 1
+  fi
+  fix_owner "${LOCK_FILE}"
+
+  if ! exec 9>"${LOCK_FILE}"; then
+    log "Failed to open lock file ${LOCK_FILE}; skipping this cycle."
+    return 1
+  fi
+  LOCK_FD_OPEN=1
+
+  if flock -n 9 2>/dev/null; then
+    LOCK_MODE="flock"
     LOCK_OWNED=1
+    write_lock_metadata
+    return 0
+  fi
+
+  lock_owner="$(read_lock_metadata_owner)"
+  log "Another sync is already running (${lock_owner}); skipping this cycle."
+  close_lock_fd
+  return 1
+}
+
+acquire_legacy_lock() {
+  if mkdir -m 0777 "${LEGACY_LOCK_DIR}" 2>/dev/null; then
+    fix_owner "${LEGACY_LOCK_DIR}"
+    printf '%s\n' "$$" > "${LEGACY_LOCK_PID_FILE}" 2>/dev/null || true
+    fix_owner "${LEGACY_LOCK_PID_FILE}"
+    LOCK_MODE="legacy"
+    LOCK_OWNED=1
+    write_lock_metadata
     return 0
   fi
 
   lock_pid=""
-  if [ -f "${LOCK_PID_FILE}" ]; then
-    lock_pid="$(cat "${LOCK_PID_FILE}" 2>/dev/null || true)"
+  if [ -f "${LEGACY_LOCK_PID_FILE}" ]; then
+    lock_pid="$(cat "${LEGACY_LOCK_PID_FILE}" 2>/dev/null || true)"
   fi
 
   case "${lock_pid}" in
@@ -455,20 +593,22 @@ acquire_lock() {
   esac
 
   if [ -n "${lock_pid}" ] && kill -0 "${lock_pid}" >/dev/null 2>&1; then
-    log "Another sync is already running (pid=${lock_pid}); skipping this cycle."
+    lock_owner="$(read_lock_metadata_owner)"
+    log "Another sync is already running (legacy pid=${lock_pid}; ${lock_owner}); skipping this cycle."
     return 1
   fi
 
   # Do not auto-recover lock here: PID namespaces and short races between
   # mkdir/pid-write can make a live lock look stale and cause parallel syncs.
   if [ -n "${lock_pid}" ]; then
-    log "Sync lock exists with non-running pid=${lock_pid}; skipping to avoid parallel sync. Remove ${LOCK_DIR} manually if needed."
+    log "Legacy sync lock exists with non-running pid=${lock_pid}; skipping to avoid parallel sync. Remove ${LEGACY_LOCK_DIR} manually if needed."
   else
-    log "Sync lock exists without a valid pid; skipping to avoid parallel sync. Remove ${LOCK_DIR} manually if needed."
+    log "Legacy sync lock exists without a valid pid; skipping to avoid parallel sync. Remove ${LEGACY_LOCK_DIR} manually if needed."
   fi
   return 1
 }
 
+LOCK_INVOKER="$(detect_lock_invoker)"
 if ! acquire_lock; then
   exit 0
 fi
@@ -522,21 +662,38 @@ cleanup_lock() {
   fi
 
   if [ "${LOCK_OWNED}" -ne 1 ]; then
+    close_lock_fd
     return 0
   fi
 
-  lock_pid=""
-  if [ -f "${LOCK_PID_FILE}" ]; then
-    lock_pid="$(cat "${LOCK_PID_FILE}" 2>/dev/null || true)"
+  if lock_metadata_owned_by_self; then
+    rm -f "${LOCK_META_FILE}" >/dev/null 2>&1 || true
   fi
 
-  if [ -n "${lock_pid}" ] && [ "${lock_pid}" != "$$" ]; then
-    log "Lock ownership changed to pid=${lock_pid}; keeping ${LOCK_DIR}."
-    return 0
-  fi
+  case "${LOCK_MODE}" in
+    flock)
+      close_lock_fd
+      ;;
+    legacy)
+      lock_pid=""
+      if [ -f "${LEGACY_LOCK_PID_FILE}" ]; then
+        lock_pid="$(cat "${LEGACY_LOCK_PID_FILE}" 2>/dev/null || true)"
+      fi
 
-  rm -f "${LOCK_PID_FILE}" >/dev/null 2>&1 || true
-  rm -rf "${LOCK_DIR}" >/dev/null 2>&1 || true
+      if [ -n "${lock_pid}" ] && [ "${lock_pid}" != "$$" ]; then
+        log "Legacy lock ownership changed to pid=${lock_pid}; keeping ${LEGACY_LOCK_DIR}."
+        close_lock_fd
+        return 0
+      fi
+
+      rm -f "${LEGACY_LOCK_PID_FILE}" >/dev/null 2>&1 || true
+      rm -rf "${LEGACY_LOCK_DIR}" >/dev/null 2>&1 || true
+      close_lock_fd
+      ;;
+    *)
+      close_lock_fd
+      ;;
+  esac
 }
 
 on_interrupt() {

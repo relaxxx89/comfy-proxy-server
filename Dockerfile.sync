@@ -1,7 +1,7 @@
 ARG DOCKER_CLI_IMAGE=docker.io/docker:27-cli
 FROM ${DOCKER_CLI_IMAGE}
 
-RUN apk add --no-cache bash curl jq coreutils
+RUN apk add --no-cache bash curl jq coreutils util-linux
 
 WORKDIR /opt/app
 COPY scripts ./scripts
