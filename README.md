@@ -88,6 +88,7 @@ cp .env.example .env
 | `THROUGHPUT_MIN_KBPS` | нет | `2200` | минимум скорости для попадания в ranked |
 | `THROUGHPUT_SAMPLES` | нет | `5` | сколько speed-замеров делать на один прокси |
 | `THROUGHPUT_REQUIRED_SUCCESSES` | нет | `4` | минимум успешных замеров (>= `THROUGHPUT_MIN_KBPS`) для включения прокси в ranked |
+| `THROUGHPUT_BENCH_DYNAMIC_PORTS` | нет | `true` | автоматически выбирать свободные порты bench-runtime (рекомендуется) |
 | `THROUGHPUT_BENCH_PROXY_PORT` | нет | `17890` | mixed-port изолированного bench-runtime для speed-тестов |
 | `THROUGHPUT_BENCH_API_PORT` | нет | `19090` | controller API порт изолированного bench-runtime |
 | `THROUGHPUT_BENCH_DOCKER_TIMEOUT_SEC` | нет | `20` | timeout docker-операций bench-runtime |
@@ -153,7 +154,13 @@ journalctl -u mihomo-gateway.service -n 100 --no-pager
 - `reason=no_quality_proxies`: quality filter отфильтровал все узлы, проверь `SANITIZE_EXCLUDE_HOST_PATTERNS` и качество источника.
 - `throughput_reason=api_unreachable`: Mihomo controller недоступен на `API_BIND`.
 - `throughput_reason=tools_missing`: в sync-окружении нет `curl/jq`.
-- `throughput_reason=bench_runtime_unavailable`: не удалось поднять изолированный bench-runtime (docker/порт/контейнер).
+- `throughput_reason=bench_runtime_unavailable`: не удалось поднять изолированный bench-runtime (legacy/generic причина).
+- `throughput_reason=bench_runtime_port_conflict`: не удалось выбрать/использовать порты isolated bench-runtime.
+- `throughput_reason=bench_runtime_create_failed`: ошибка `docker create` для isolated bench-runtime.
+- `throughput_reason=bench_runtime_cp_candidate_failed`: ошибка копирования candidate provider в isolated bench-runtime.
+- `throughput_reason=bench_runtime_cp_config_failed`: ошибка копирования bench config в isolated bench-runtime.
+- `throughput_reason=bench_runtime_start_failed`: ошибка `docker start` для isolated bench-runtime.
+- `throughput_reason=bench_runtime_api_timeout`: isolated bench-runtime поднялся, но API `/version` не стал доступен вовремя.
 - `throughput_reason=bench_unavailable`: (обычно при `THROUGHPUT_ISOLATED=false`) в текущем runtime-конфиге группа `PROXY` не содержит `BENCH`; перерендери конфиг (`./scripts/validate-config.sh` или `./scripts/up.sh`).
 - `throughput_reason=rank_exec_failed`: скрипт ранжирования завершился с ошибкой (деталь в логе `[subscription-sync] Throughput ranking script failed ...`).
 - `throughput_reason=rank_output_empty`: скрипт ранжирования завершился без метрик/результата; используется fallback на исходный provider.

@@ -92,6 +92,7 @@ THROUGHPUT_REQUIRED_SUCCESSES="${THROUGHPUT_REQUIRED_SUCCESSES:-0}"
 THROUGHPUT_ISOLATED="${THROUGHPUT_ISOLATED:-true}"
 THROUGHPUT_BENCH_PROXY_PORT="${THROUGHPUT_BENCH_PROXY_PORT:-17890}"
 THROUGHPUT_BENCH_API_PORT="${THROUGHPUT_BENCH_API_PORT:-19090}"
+THROUGHPUT_BENCH_DYNAMIC_PORTS="${THROUGHPUT_BENCH_DYNAMIC_PORTS:-true}"
 THROUGHPUT_BENCH_DOCKER_TIMEOUT_SEC="${THROUGHPUT_BENCH_DOCKER_TIMEOUT_SEC:-20}"
 THROUGHPUT_BENCH_API_SECRET="${THROUGHPUT_BENCH_API_SECRET:-bench-secret-$$}"
 PROXY_PORT="${PROXY_PORT:-7890}"
@@ -176,6 +177,15 @@ case "${THROUGHPUT_ISOLATED}" in
     ;;
 esac
 
+case "${THROUGHPUT_BENCH_DYNAMIC_PORTS}" in
+  true|TRUE|1|yes|YES)
+    THROUGHPUT_BENCH_DYNAMIC_PORTS=true
+    ;;
+  *)
+    THROUGHPUT_BENCH_DYNAMIC_PORTS=false
+    ;;
+esac
+
 case "${THROUGHPUT_BENCH_PROXY_PORT}" in
   ''|*[!0-9]*)
     THROUGHPUT_BENCH_PROXY_PORT=17890
@@ -215,6 +225,8 @@ restore_target="AUTO_FAILSAFE"
 proxy_switched_to_bench=0
 cleanup_done=0
 bench_container_name=""
+bench_proxy_port="${THROUGHPUT_BENCH_PROXY_PORT}"
+bench_api_port="${THROUGHPUT_BENCH_API_PORT}"
 
 api_base=""
 auth_header=""
@@ -264,6 +276,134 @@ setup_api_context() {
   else
     auth_header=""
   fi
+}
+
+error_summary() {
+  printf '%s' "$1" \
+    | tr '\n' ' ' \
+    | sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+    | cut -c1-400
+}
+
+port_in_use() {
+  port="$1"
+  case "${port}" in
+    ''|*[!0-9]*)
+      return 0
+      ;;
+  esac
+
+  if command -v ss >/dev/null 2>&1; then
+    if ss -ltn 2>/dev/null | awk -v p="${port}" '
+    NR > 1 {
+      addr = $4
+      sub(/^.*:/, "", addr)
+      if (addr == p) {
+        found = 1
+        exit
+      }
+    }
+    END { exit found ? 0 : 1 }
+    '; then
+      return 0
+    fi
+    return 1
+  fi
+
+  port_hex="$(printf '%04X' "${port}" 2>/dev/null || true)"
+  if [ -z "${port_hex}" ]; then
+    return 0
+  fi
+
+  if awk -v ph="${port_hex}" '
+  FNR == 1 { next }
+  {
+    split($2, a, ":")
+    if (toupper(a[2]) == ph) {
+      found = 1
+      exit
+    }
+  }
+  END { exit found ? 0 : 1 }
+  ' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+find_free_port() {
+  range_start="$1"
+  range_end="$2"
+  avoid_port="${3:-}"
+  port="${range_start}"
+
+  while [ "${port}" -le "${range_end}" ]; do
+    if [ -n "${avoid_port}" ] && [ "${port}" -eq "${avoid_port}" ]; then
+      port=$((port + 1))
+      continue
+    fi
+    if ! port_in_use "${port}"; then
+      printf '%s\n' "${port}"
+      return 0
+    fi
+    port=$((port + 1))
+  done
+  return 1
+}
+
+resolve_bench_ports() {
+  bench_proxy_port="${THROUGHPUT_BENCH_PROXY_PORT}"
+  bench_api_port="${THROUGHPUT_BENCH_API_PORT}"
+
+  if [ "${THROUGHPUT_BENCH_DYNAMIC_PORTS}" = "true" ]; then
+    bench_proxy_port="$(find_free_port 17890 18890 "")" || {
+      throughput_reason="bench_runtime_port_conflict"
+      log "Failed to allocate free bench proxy port in 17890-18890."
+      return 1
+    }
+    bench_api_port="$(find_free_port 19090 20090 "${bench_proxy_port}")" || {
+      throughput_reason="bench_runtime_port_conflict"
+      log "Failed to allocate free bench API port in 19090-20090."
+      return 1
+    }
+    return 0
+  fi
+
+  if port_in_use "${bench_proxy_port}"; then
+    throughput_reason="bench_runtime_port_conflict"
+    log "Configured bench proxy port ${bench_proxy_port} is already in use."
+    return 1
+  fi
+  if port_in_use "${bench_api_port}"; then
+    throughput_reason="bench_runtime_port_conflict"
+    log "Configured bench API port ${bench_api_port} is already in use."
+    return 1
+  fi
+  return 0
+}
+
+cleanup_orphan_bench_containers() {
+  stale_ids="$(docker ps -aq --filter "name=mihomo-throughput-" 2>/dev/null || true)"
+  if [ -z "${stale_ids}" ]; then
+    return 0
+  fi
+
+  cleaned=0
+  for stale_id in ${stale_ids}; do
+    stale_status="$(docker inspect -f '{{.State.Status}}' "${stale_id}" 2>/dev/null || true)"
+    case "${stale_status}" in
+      running)
+        continue
+        ;;
+    esac
+    run_bench_docker docker rm -fv "${stale_id}" >/dev/null 2>&1 || true
+    cleaned=$((cleaned + 1))
+  done
+
+  if [ "${cleaned}" -gt 0 ]; then
+    log "Cleaned up ${cleaned} orphan bench container(s)."
+  fi
+  return 0
 }
 
 bench_selector_ready_once() {
@@ -402,21 +542,35 @@ cleanup_isolated_runtime() {
 
 start_isolated_runtime() {
   if ! command -v docker >/dev/null 2>&1; then
-    throughput_reason="bench_runtime_unavailable"
+    throughput_reason="bench_runtime_create_failed"
+    log "Docker CLI is unavailable in subscription-sync runtime."
+    return 1
+  fi
+
+  if ! resolve_bench_ports; then
+    return 1
+  fi
+
+  cleanup_orphan_bench_containers
+
+  if [ "${bench_proxy_port}" -eq "${bench_api_port}" ]; then
+    throughput_reason="bench_runtime_port_conflict"
+    log "Bench proxy/api ports must differ (port=${bench_proxy_port})."
     return 1
   fi
 
   cp "${INPUT_FILE}" "${BENCH_PROVIDER_FILE}" || {
-    throughput_reason="bench_runtime_unavailable"
+    throughput_reason="bench_runtime_cp_candidate_failed"
+    log "Failed to prepare bench provider file from ${INPUT_FILE}."
     return 1
   }
 
   cat > "${BENCH_CONFIG_FILE}" <<EOF
-mixed-port: ${THROUGHPUT_BENCH_PROXY_PORT}
+mixed-port: ${bench_proxy_port}
 allow-lan: false
 mode: rule
 log-level: error
-external-controller: 127.0.0.1:${THROUGHPUT_BENCH_API_PORT}
+external-controller: 127.0.0.1:${bench_api_port}
 secret: "${THROUGHPUT_BENCH_API_SECRET}"
 proxy-providers:
   test:
@@ -444,39 +598,43 @@ rules:
 EOF
 
   bench_container_name="mihomo-throughput-$$-$(date +%s)"
-  if ! run_bench_docker docker create --name "${bench_container_name}" \
+  if ! create_output="$(run_bench_docker docker create --name "${bench_container_name}" \
     --network host \
     "${MIHOMO_IMAGE}" \
     -d /root/.config/mihomo \
-    -f /root/.config/mihomo/bench-config.yaml >/dev/null; then
-    throughput_reason="bench_runtime_unavailable"
+    -f /root/.config/mihomo/bench-config.yaml 2>&1)"; then
+    throughput_reason="bench_runtime_create_failed"
+    log "Bench docker create failed: $(error_summary "${create_output}")"
     cleanup_isolated_runtime
     return 1
   fi
 
-  if ! run_bench_docker docker cp "${BENCH_PROVIDER_FILE}" "${bench_container_name}:/root/.config/mihomo/candidate.txt" >/dev/null; then
-    throughput_reason="bench_runtime_unavailable"
+  if ! cp_candidate_output="$(run_bench_docker docker cp "${BENCH_PROVIDER_FILE}" "${bench_container_name}:/root/.config/mihomo/candidate.txt" 2>&1)"; then
+    throughput_reason="bench_runtime_cp_candidate_failed"
+    log "Bench docker cp candidate failed: $(error_summary "${cp_candidate_output}")"
     cleanup_isolated_runtime
     return 1
   fi
 
-  if ! run_bench_docker docker cp "${BENCH_CONFIG_FILE}" "${bench_container_name}:/root/.config/mihomo/bench-config.yaml" >/dev/null; then
-    throughput_reason="bench_runtime_unavailable"
+  if ! cp_config_output="$(run_bench_docker docker cp "${BENCH_CONFIG_FILE}" "${bench_container_name}:/root/.config/mihomo/bench-config.yaml" 2>&1)"; then
+    throughput_reason="bench_runtime_cp_config_failed"
+    log "Bench docker cp config failed: $(error_summary "${cp_config_output}")"
     cleanup_isolated_runtime
     return 1
   fi
 
-  if ! run_bench_docker docker start "${bench_container_name}" >/dev/null; then
-    throughput_reason="bench_runtime_unavailable"
+  if ! start_output="$(run_bench_docker docker start "${bench_container_name}" 2>&1)"; then
+    throughput_reason="bench_runtime_start_failed"
+    log "Bench docker start failed: $(error_summary "${start_output}")"
     cleanup_isolated_runtime
     return 1
   fi
-  setup_api_context "http://127.0.0.1:${THROUGHPUT_BENCH_API_PORT}" "${THROUGHPUT_BENCH_API_SECRET}"
+  setup_api_context "http://127.0.0.1:${bench_api_port}" "${THROUGHPUT_BENCH_API_SECRET}"
 
   api_wait_attempt=1
   while [ "${api_wait_attempt}" -le 20 ]; do
     if api_call GET "/version" >/dev/null 2>&1; then
-      PROXY_PORT="${THROUGHPUT_BENCH_PROXY_PORT}"
+      PROXY_PORT="${bench_proxy_port}"
       PROXY_AUTH=""
       return 0
     fi
@@ -484,7 +642,8 @@ EOF
     api_wait_attempt=$((api_wait_attempt + 1))
   done
 
-  throughput_reason="bench_runtime_unavailable"
+  throughput_reason="bench_runtime_api_timeout"
+  log "Bench runtime API did not become ready on 127.0.0.1:${bench_api_port} within timeout."
   cleanup_isolated_runtime
   return 1
 }

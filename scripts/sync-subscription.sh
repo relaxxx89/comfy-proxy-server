@@ -477,7 +477,11 @@ EOF
 
   if [ ! -s "${RANKED_PROVIDER_FILE}" ]; then
     replace_file_from_source "${PROVIDER_FILE}" "${RANKED_PROVIDER_FILE}" 2>/dev/null || true
-    throughput_reason="rank_output_empty"
+    case "${throughput_reason}" in
+      ''|not_run|ok)
+        throughput_reason="rank_output_empty"
+        ;;
+    esac
   fi
   fix_owner "${RANKED_PROVIDER_FILE}"
 }
